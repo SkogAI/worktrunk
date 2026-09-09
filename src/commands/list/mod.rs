@@ -3,7 +3,9 @@
 //! # Performance
 //!
 //! `wt list` runs multiple git commands per worktree in parallel using Rayon. Performance
-//! depends heavily on git's internal caches, not worktrunk-specific caching.
+//! depends heavily on git's internal caches, and — for the commit-graph-derived commands —
+//! on worktrunk's own on-disk caches, which elide those commands entirely on a warm cache
+//! (see "Worktrunk's Own Caches" below).
 //!
 //! ## Time to First Information
 //!
@@ -55,9 +57,16 @@
 //! For each worktree, we execute:
 //! - `git status --porcelain` - Working tree state (uses index cache)
 //! - `git rev-list --count <base>..<head>` - Ahead/behind counts (uses commit graph)
-//! - `git diff --shortstat HEAD` - Working tree line diffs (uses index + tree objects)
+//! - Working tree line diffs:
+//!   - Without untracked files: `git diff --shortstat --find-renames HEAD`
+//!   - With untracked files: `git ls-files --others`, a temporary index copy plus
+//!     `git add --intent-to-add`, and two `git diff --numstat -z --find-renames HEAD` calls
 //! - `git diff --shortstat <base>...<head>` - Branch line diffs (uses tree objects)
 //! - `git rev-parse <ref>` - Ref resolution (uses ref cache)
+//!
+//! `HEAD±` always enables rename detection because pairing a tracked deletion with an
+//! untracked destination makes a move line-neutral. `main…±` compares committed trees
+//! and continues to use the user's configured rename policy.
 //!
 //! Plus one global command:
 //! - `git worktree list --porcelain` - List all worktrees (uses ref cache)
@@ -91,14 +100,19 @@
 //!    - `git gc` consolidates loose objects into packs
 //!    - More efficient for tree/blob access in diffs
 //!
-//! ## Worktrunk's Only Cache: Default Branch
+//! ## Worktrunk's Own Caches
 //!
-//! Worktrunk caches only the default branch name (main/master) in
+//! The default branch name (main/master) is cached in
 //! `git config worktrunk.default-branch`. The remote HEAD ref (e.g., `origin/HEAD`)
-//! is git's cache; worktrunk reads it but does not set it. All other data is fetched
-//! fresh on each `wt list` invocation.
+//! is git's cache; worktrunk reads it but does not set it. Clear it with
+//! `wt config state default-branch clear`.
 //!
-//! Clear cache with: `wt config state default-branch clear`
+//! A collect also reads and writes the on-disk caches under `.git/wt/cache/`, so some of the
+//! per-worktree git commands above — the ahead/behind counts and the branch line diff — are
+//! what a *cold* cache costs, while `git status` and the working-tree diff run on every
+//! invocation regardless. The authoritative inventory — every directory, its key scheme, and
+//! when an entry goes stale — is the `## Caching` table in [`collect`]; don't restate it
+//! here. Clear those with `wt config state cache clear`.
 //!
 //! ## Performance Characteristics
 //!
@@ -111,7 +125,8 @@
 //! Bottlenecks:
 //! 1. `git status --porcelain` - Slowest when index is cold or many files changed
 //! 2. `git rev-list --count` - Slow without commit graph in repos with deep history
-//! 3. `git diff --shortstat` - Slow for large diffs or when pack files aren't cached
+//! 3. Working tree diff - Slow for large tracked diffs or cold pack files; untracked
+//!    paths also require enumeration, a temporary index write, and two numstat diffs
 //!
 //! Optimization tips:
 //! - Run `git commit-graph write --reachable --changed-paths` to speed up commit counting
@@ -135,7 +150,7 @@ use anstyle::Style;
 use model::{BranchScope, ItemKind, ListData, ListItem};
 use progressive::RenderTarget;
 use worktrunk::git::Repository;
-use worktrunk::styling::{INFO_SYMBOL, eprintln};
+use worktrunk::styling::{INFO_SYMBOL, eprintln, terminal_width, wrap_styled_text};
 
 use crate::output::print_json;
 
@@ -153,8 +168,15 @@ pub fn handle_list(
 ) -> anyhow::Result<()> {
     let render_target = RenderTarget::detect(format, progressive_flag);
 
-    // Resolve the JSON schema before collecting, so the unset-nag lands
-    // above the output rather than after a long collection.
+    // A `.config/wt.toml` that doesn't parse reaches the listing only through
+    // accessors that shrug it off (`[list] url`, `[forge] platform`), so it
+    // would otherwise leave no trace on the command run most often. Warn
+    // ahead of `collect()`, where those accessors run, so the line lands
+    // above the rows instead of between them.
+    repo.warn_if_project_config_unloadable();
+
+    // Resolve the JSON schema before collecting, so an invalid-value warning
+    // lands above the output rather than after a long collection.
     let json_schema =
         matches!(render_target, RenderTarget::Json).then(|| resolve_json_schema(&repo));
 
@@ -194,28 +216,16 @@ pub fn handle_list(
 
 /// Resolve `[list] json-schema` (per-project resolved config) to 1 or 2.
 ///
-/// Unset defaults to schema 1 and nags once per process; an out-of-range
-/// value warns and defaults to schema 1, matching how config load treats a
+/// Unset defaults to schema 2; an out-of-range value warns and defaults to
+/// schema 2, matching how config load treats a
 /// type error in the same key (warn and degrade, never brick a command).
-/// Both messages honor warning suppression — on the statusline, stderr
-/// would corrupt the consumer's prompt, and the same user sees the nag on
-/// their next interactive run.
-///
-/// The unset state is the `PendingDefault` row in `DEPRECATION_RULES`, but
-/// its warning fires here rather than at config load: the setting only
-/// matters to JSON consumers, so a load-time warning would nag every command
-/// for every user without the key. `wt config update` pins the current
-/// `json-schema = 1` (the behavior-preserving choice; adopting schema 2 is a
-/// deliberate manual edit), so the nag's hint offers that command exactly
-/// when running it would write the pin — decided by the same detection
-/// update runs, so a missing, unreadable, or malformed user config falls
-/// back to naming the manual setting instead (migration plan in
-/// design/list-json-v2.md, reviewed in #3357).
+/// The warning honors warning suppression because stderr would corrupt the
+/// statusline consumer's prompt.
 pub(crate) fn resolve_json_schema(repo: &Repository) -> u8 {
     use std::sync::Once;
 
     use color_print::cformat;
-    use worktrunk::styling::{hint_message, warning_message};
+    use worktrunk::styling::warning_message;
 
     static WARNED: Once = Once::new();
     match repo.config().list.json_schema {
@@ -228,47 +238,13 @@ pub(crate) fn resolve_json_schema(repo: &Repository) -> u8 {
                 eprintln!(
                     "{}",
                     warning_message(cformat!(
-                        "[list] json-schema is <bold>{other}</>, expected 1 or 2; using schema 1"
+                        "[list] json-schema is <bold>{other}</>, expected 1 or 2; using schema 2"
                     ))
                 );
             });
-            1
+            2
         }
-        None => {
-            WARNED.call_once(|| {
-                if worktrunk::config::warnings_suppressed() {
-                    return;
-                }
-                eprintln!(
-                    "{}",
-                    warning_message(
-                        "JSON output is schema 1; a future release switches the default to schema 2"
-                    )
-                );
-                let update_would_pin = worktrunk::config::config_path()
-                    .and_then(|p| std::fs::read_to_string(p).ok())
-                    .is_some_and(|content| {
-                        worktrunk::config::detect_deprecations(
-                            &content,
-                            worktrunk::config::ConfigFileKind::User,
-                        )
-                        .iter()
-                        .any(|k| matches!(k, worktrunk::config::DeprecationKind::JsonSchemaUnset))
-                    });
-                let keep = if update_would_pin {
-                    cformat!("run <underline>wt config update</>")
-                } else {
-                    cformat!("<underline>json-schema = 1</>")
-                };
-                eprintln!(
-                    "{}",
-                    hint_message(cformat!(
-                        "To adopt the new schema set <underline>[list] json-schema = 2</>; to keep this format, {keep}"
-                    ))
-                );
-            });
-            1
-        }
+        None => 2,
     }
 }
 
@@ -309,7 +285,7 @@ impl SummaryMetrics {
             // may legitimately be named `origin/foo`, so a name-prefix
             // heuristic would misclassify it. See `BranchScope` in
             // `model/item.rs`.
-            match item.kind {
+            match item.kind() {
                 ItemKind::Branch(BranchScope::Remote) => self.remote_branches += 1,
                 _ => self.local_branches += 1,
             }
@@ -323,7 +299,7 @@ impl SummaryMetrics {
     pub(super) fn summary_parts(
         &self,
         include_branches: bool,
-        hidden_columns: usize,
+        hidden_columns: &[String],
     ) -> Vec<String> {
         let mut parts = Vec::new();
 
@@ -348,51 +324,62 @@ impl SummaryMetrics {
             parts.push(format!("{} ahead", self.ahead_items));
         }
 
-        if hidden_columns > 0 {
-            let plural = if hidden_columns == 1 {
-                "column"
-            } else {
-                "columns"
-            };
-            parts.push(format!("{} {} hidden", hidden_columns, plural));
+        if !hidden_columns.is_empty() {
+            parts.push(format!("hidden: {}", hidden_columns.join(", ")));
         }
 
         parts
     }
 }
 
-/// Format a summary message for the given items (used by both collect/mod.rs and mod.rs)
+/// Format the summary line that closes the table.
+///
+/// The footer is the only home a timed-out task has: it leaves an empty cell
+/// and no message to print, so the count here is all that reports it. Tasks
+/// that failed instead get a named entry in the warning that follows the
+/// table, and that warning carries its own count — repeating it here would
+/// print the same number twice on adjacent lines.
+///
+/// `max_width` bounds the line, following [`format_with_gutter`]'s
+/// convention: `None` detects the terminal, and no detectable width wraps
+/// nothing. The hidden-column list grows with every column a narrow terminal
+/// drops, so the footer is longest exactly where there is least room for it —
+/// at 40 columns it ran to 67 for a table that fit. Continuations indent
+/// under the text, keeping them subordinate to the `○`.
+///
+/// [`format_with_gutter`]: worktrunk::styling::format_with_gutter
 pub(crate) fn format_summary_message(
     items: &[ListItem],
     show_branches: bool,
-    hidden_column_count: usize,
-    error_count: usize,
+    hidden_columns: &[String],
     timed_out_count: usize,
+    max_width: Option<usize>,
 ) -> String {
+    const INDENT: &str = "  "; // symbol + space, so continuations align under the text
+
     let metrics = SummaryMetrics::from_items(items);
     let dim = Style::new().dimmed();
     let summary = metrics
-        .summary_parts(show_branches, hidden_column_count)
+        .summary_parts(show_branches, hidden_columns)
         .join(", ");
 
-    if error_count > 0 {
-        let failure_msg = if error_count == timed_out_count {
-            // All failures are timeouts
-            let plural = if timed_out_count == 1 { "" } else { "s" };
-            format!("{timed_out_count} task{plural} timed out")
-        } else if timed_out_count > 0 {
-            // Mix of timeouts and other errors
-            let plural = if error_count == 1 { "" } else { "s" };
-            format!("{error_count} task{plural} failed ({timed_out_count} timed out)")
-        } else {
-            // No timeouts, just other errors
-            let plural = if error_count == 1 { "" } else { "s" };
-            format!("{error_count} task{plural} failed")
-        };
-        format!("{INFO_SYMBOL} {dim}Showing {summary}. {failure_msg}{dim:#}")
+    let body = if timed_out_count > 0 {
+        let plural = if timed_out_count == 1 { "" } else { "s" };
+        format!("Showing {summary}; {timed_out_count} task{plural} timed out")
     } else {
-        format!("{INFO_SYMBOL} {dim}Showing {summary}{dim:#}")
-    }
+        format!("Showing {summary}")
+    };
+
+    let width = max_width.or_else(terminal_width).unwrap_or(usize::MAX);
+    let body = wrap_styled_text(&body, width.saturating_sub(INDENT.len()))
+        .iter()
+        // The wrapper keeps the space it broke on, which would land a
+        // continuation one column right of the indent.
+        .map(|line| line.trim())
+        .collect::<Vec<_>>()
+        .join(&format!("\n{INDENT}"));
+
+    format!("{INFO_SYMBOL} {dim}{body}{dim:#}")
 }
 
 #[cfg(test)]
@@ -438,7 +425,7 @@ mod tests {
             dirty_worktrees: 0,
             ahead_items: 0,
         };
-        let parts = metrics.summary_parts(false, 0);
+        let parts = metrics.summary_parts(false, &[]);
         assert_eq!(parts, vec!["1 worktree"]);
     }
 
@@ -451,7 +438,7 @@ mod tests {
             dirty_worktrees: 0,
             ahead_items: 0,
         };
-        let parts = metrics.summary_parts(false, 0);
+        let parts = metrics.summary_parts(false, &[]);
         assert_eq!(parts, vec!["3 worktrees"]);
     }
 
@@ -464,7 +451,7 @@ mod tests {
             dirty_worktrees: 0,
             ahead_items: 0,
         };
-        let parts = metrics.summary_parts(true, 0);
+        let parts = metrics.summary_parts(true, &[]);
         assert_eq!(
             parts,
             vec!["2 worktrees", "5 branches", "10 remote branches"]
@@ -480,7 +467,7 @@ mod tests {
             dirty_worktrees: 2,
             ahead_items: 0,
         };
-        let parts = metrics.summary_parts(false, 0);
+        let parts = metrics.summary_parts(false, &[]);
         assert_eq!(parts, vec!["3 worktrees", "2 with changes"]);
     }
 
@@ -493,7 +480,7 @@ mod tests {
             dirty_worktrees: 0,
             ahead_items: 1,
         };
-        let parts = metrics.summary_parts(false, 0);
+        let parts = metrics.summary_parts(false, &[]);
         assert_eq!(parts, vec!["2 worktrees", "1 ahead"]);
     }
 
@@ -506,11 +493,14 @@ mod tests {
             dirty_worktrees: 0,
             ahead_items: 0,
         };
-        let parts = metrics.summary_parts(false, 1);
-        assert_eq!(parts, vec!["1 worktree", "1 column hidden"]);
+        let parts = metrics.summary_parts(false, &["Message".to_string()]);
+        assert_eq!(parts, vec!["1 worktree", "hidden: Message"]);
 
-        let parts = metrics.summary_parts(false, 3);
-        assert_eq!(parts, vec!["1 worktree", "3 columns hidden"]);
+        let parts = metrics.summary_parts(
+            false,
+            &["Path".to_string(), "Commit".to_string(), "Age".to_string()],
+        );
+        assert_eq!(parts, vec!["1 worktree", "hidden: Path, Commit, Age"]);
     }
 
     #[test]
@@ -522,7 +512,7 @@ mod tests {
             dirty_worktrees: 0,
             ahead_items: 0,
         };
-        let parts = metrics.summary_parts(true, 0);
+        let parts = metrics.summary_parts(true, &[]);
         assert_eq!(parts, vec!["2 worktrees", "5 remote branches"]);
     }
 
@@ -535,7 +525,7 @@ mod tests {
             dirty_worktrees: 2,
             ahead_items: 4,
         };
-        let parts = metrics.summary_parts(true, 2);
+        let parts = metrics.summary_parts(true, &["Commit".to_string(), "Age".to_string()]);
         assert_eq!(
             parts,
             vec![
@@ -544,7 +534,7 @@ mod tests {
                 "8 remote branches",
                 "2 with changes",
                 "4 ahead",
-                "2 columns hidden"
+                "hidden: Commit, Age"
             ]
         );
     }
@@ -553,17 +543,12 @@ mod tests {
     fn test_format_summary_message_error_variants() {
         use insta::assert_snapshot;
 
-        // No errors
-        assert_snapshot!(format_summary_message(&[], false, 0, 0, 0), @"[2m○[22m [2mShowing 0 worktrees[0m");
-        // All timeouts
-        assert_snapshot!(format_summary_message(&[], false, 0, 3, 3), @"[2m○[22m [2mShowing 0 worktrees. 3 tasks timed out[0m");
-        // Mixed errors and timeouts
-        assert_snapshot!(format_summary_message(&[], false, 0, 5, 3), @"[2m○[22m [2mShowing 0 worktrees. 5 tasks failed (3 timed out)[0m");
-        // Only failures, no timeouts
-        assert_snapshot!(format_summary_message(&[], false, 0, 2, 0), @"[2m○[22m [2mShowing 0 worktrees. 2 tasks failed[0m");
-        // Single error
-        assert_snapshot!(format_summary_message(&[], false, 0, 1, 0), @"[2m○[22m [2mShowing 0 worktrees. 1 task failed[0m");
+        // Nothing timed out. Failures alone leave the footer untouched — the
+        // warning after the table names them and carries their count.
+        assert_snapshot!(format_summary_message(&[], false, &[], 0, None), @"[2m○[22m [2mShowing 0 worktrees[0m");
         // Single timeout
-        assert_snapshot!(format_summary_message(&[], false, 0, 1, 1), @"[2m○[22m [2mShowing 0 worktrees. 1 task timed out[0m");
+        assert_snapshot!(format_summary_message(&[], false, &[], 1, None), @"[2m○[22m [2mShowing 0 worktrees; 1 task timed out[0m");
+        // Several timeouts
+        assert_snapshot!(format_summary_message(&[], false, &[], 3, None), @"[2m○[22m [2mShowing 0 worktrees; 3 tasks timed out[0m");
     }
 }

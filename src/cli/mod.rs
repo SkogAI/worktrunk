@@ -6,9 +6,9 @@ mod step;
 pub(crate) use config::{
     ApprovalsCommand, CacheAction, CiStatusAction, ConfigAliasCommand, ConfigCommand,
     ConfigPluginsClaudeCommand, ConfigPluginsCodexCommand, ConfigPluginsCommand,
-    ConfigPluginsOpencodeCommand, ConfigShellCommand, DefaultBranchAction, GlobalFormatFlag,
-    HintsAction, LogsAction, MarkerAction, PreviousBranchAction, StateCommand, StateWrite,
-    VarsAction,
+    ConfigPluginsOpencodeCommand, ConfigPluginsPiCommand, ConfigShellCommand, DefaultBranchAction,
+    GlobalFormatFlag, HintsAction, LogsAction, MarkerAction, PreviousBranchAction, StateCommand,
+    StateWrite, VarsAction,
 };
 pub(crate) use hook::{HOOK_TYPE_NAMES, HookCommand, HookOptions, parse_hook_type};
 pub(crate) use list::ListSubcommand;
@@ -372,21 +372,35 @@ pub(crate) struct SwitchArgs {
     #[arg(short = 'b', long, requires = "branch", add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch)]
     pub(crate) base: Option<String>,
 
-    /// Command to run after switch
+    /// Program to run after switch
     ///
-    /// Replaces the wt process with the command after switching, giving
-    /// it full terminal control. Useful for launching editors, AI agents,
-    /// or other interactive tools.
+    /// Runs one external program after switching, with full terminal control.
+    /// Arguments after `--` go directly to that program without Worktrunk shell
+    /// parsing. Program lookup and argument decoding follow the operating system.
+    /// Shell syntax requires an explicit shell, for example
+    /// `-x sh -- -c 'npm install && npm test'`. On Windows, shell shims need
+    /// their extension (`-x code.cmd`) or an explicit shell such as
+    /// `-x cmd.exe -- /C code`.
     ///
     /// Without a branch argument, the interactive picker opens and the
     /// command runs against the selected worktree — so `wt switch -x claude`
-    /// picks a worktree, then launches Claude Code there.
+    /// picks a worktree, then launches Claude Code there. With `--no-cd`, the
+    /// program starts in the invoking directory instead.
     ///
-    /// Supports [hook template variables](@/hook.md#template-variables)
+    /// Supports [hook template variables](https://worktrunk.dev/hook/#template-variables)
     /// (`{{ branch }}`, `{{ worktree_path }}`, etc.) and filters.
     /// `{{ base }}` and `{{ base_worktree_path }}` describe the source: the
     /// selected base with `--create`, or the invoking worktree when switching
     /// to an existing worktree.
+    ///
+    /// A variable inside a shell body is substituted before that shell parses
+    /// it, so a path with spaces splits into several arguments. Pass it as a
+    /// separate argument instead — `sh` binds the first one to `$0`, so the
+    /// path arrives as `$1`:
+    ///
+    /// ```sh
+    /// wt switch feature -x sh -- -c 'cd "$1" && npm test' sh '{{ worktree_path }}'
+    /// ```
     ///
     /// Especially useful with shell aliases:
     ///
@@ -403,13 +417,12 @@ pub(crate) struct SwitchArgs {
     /// Template example: `-x code -- '{{ worktree_path }}'` opens VS Code
     /// at the worktree, `-x tmux -- new -s '{{ branch | sanitize }}'` starts
     /// a tmux session named after the branch.
-    #[arg(short = 'x', long)]
+    #[arg(short = 'x', long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub(crate) execute: Option<String>,
 
     /// Additional arguments for --execute command (after --)
     ///
-    /// Arguments after `--` are appended to the execute command.
-    /// Each argument is expanded for templates, then POSIX shell-escaped.
+    /// Each argument is expanded for templates and passed directly to the program.
     #[arg(last = true, requires = "execute")]
     pub(crate) execute_args: Vec<String>,
 
@@ -420,7 +433,8 @@ pub(crate) struct SwitchArgs {
     /// Skip directory change after switching
     ///
     /// Hooks still run normally. Useful when hooks handle navigation
-    /// (e.g., tmux workflows) or for CI/automation. Use --cd to override.
+    /// (e.g., tmux workflows) or for CI/automation. `--execute` also starts in
+    /// the invoking directory. Use --cd to override.
     #[arg(long, overrides_with = "cd")]
     pub(crate) no_cd: bool,
 
@@ -627,15 +641,17 @@ $ wt switch https://github.com/owner/repo/pull/123   # ...or paste the PR's URL
 
 The `--create` flag creates a new branch from `--base` — the default branch unless specified. Without `--create`, the branch must already exist. Switching to a remote branch (e.g., `wt switch feature` when only `origin/feature` exists) creates a local tracking branch.
 
+One rule decides the upstream, whatever `branch.autoSetupMerge` is set to: a new branch tracks the remote branch it starts from only when the two share a name. Switching to `origin/feature` shares it, so that branch tracks. `--create` need not: `--create release --base origin/release` tracks `origin/release`, while `--create feature --base origin/release` — and the bare `--base release` that resolves to it — gets no upstream. Git's default would have `feature` track `origin/release`, so under `push.default = upstream` a bare `git push` would push the new work to `release`. Publishing such a branch takes `git push --set-upstream origin <branch>`, or git's `push.autoSetupRemote = true` set once, after which a bare `git push` from the new worktree publishes it and configures its tracking.
+
 ## Creating worktrees
 
 If the branch already has a worktree, `wt switch` changes directories to it. Otherwise, it creates one:
 
-1. Runs [pre-switch hooks](@/hook.md#hook-types), blocking until complete
+1. Runs [pre-switch hooks](/hook/#hook-types), blocking until complete
 2. Creates worktree at configured path
 3. Switches to new directory
-4. Runs [pre-start hooks](@/hook.md#hook-types), blocking until complete
-5. Spawns [post-start](@/hook.md#hook-types) and [post-switch hooks](@/hook.md#hook-types) in the background
+4. Runs [pre-start hooks](/hook/#hook-types), blocking until complete
+5. Spawns [post-start](/hook/#hook-types) and [post-switch hooks](/hook/#hook-types) in the background
 
 ```console
 $ wt switch feature                        # Existing branch → creates worktree
@@ -673,7 +689,7 @@ Shortcuts also apply to `--base`. For a fork PR/MR, the head commit is fetched a
 
 When called without arguments, `wt switch` opens an interactive picker to browse and select worktrees with live preview. The candidate set widens with `--branches` (local branches without worktrees), `--remotes` (remote branches), and `--prs` (open PRs/MRs — see below).
 
-The CI column shows each row's PR/MR CI and review status, the same as [`wt list --full`](@/list.md).
+The CI column shows each row's PR/MR CI and review status, the same as [`wt list --full`](/list/).
 
 <!-- demo: wt-switch-picker.gif 1600x800 -->
 **Keybindings:**
@@ -689,8 +705,8 @@ The CI column shows each row's PR/MR CI and review status, the same as [`wt list
 | `Alt-o` | Open the selected row's PR/MR URL in the browser |
 | `Alt-r` | Refresh the list (pick up worktrees created elsewhere) |
 | `Esc` | Cancel |
-| `Alt-1`–`Alt-7` | Jump to a preview tab |
-| `Tab`/`Shift-Tab` | Cycle preview tabs forward/backward |
+| `Alt-1`–`Alt-8` | Jump to a preview tab |
+| `Tab`/`Shift-Tab` | Cycle available preview tabs forward/backward |
 | `Alt-p` | Toggle preview panel |
 | `Ctrl-u`/`Ctrl-d` | Scroll preview up/down |
 
@@ -704,13 +720,16 @@ Typing a gutter sigil filters by row kind: `+` narrows to linked worktrees and `
 
 **Preview tabs:**
 
-1. **HEAD±** — Diff of uncommitted changes
-2. **log** — Recent commits; commits already on the default branch have dimmed hashes
-3. **main…±** — Diff of changes since the merge-base with the default branch
-4. **remote⇅** — Ahead/behind diff vs upstream tracking branch
-5. **summary** — LLM-generated branch summary; requires `[list] summary = true` and [`commit.generation`](@/config.md#commit)
-6. **pr** — The selected row's PR/MR, for any row whose branch has one
-7. **comments** — The PR/MR's comment thread, fetched from the forge for any row whose branch has one
+1. **diff** — One net diff from the comparison base through the current worktree: committed, staged, unstaged, and untracked changes
+2. **working** — Staged, unstaged, and untracked changes against `HEAD`
+3. **committed** — Committed changes since the comparison base
+4. **log** — Recent commits; commits already on the default branch have dimmed hashes
+5. **remote⇅** — Ahead/behind diff vs upstream tracking branch
+6. **summary** — LLM-generated branch summary; requires `[list] summary = true` and [`commit.generation`](/config/#commit)
+7. **pr** — The selected row's PR/MR, for any row whose branch has one
+8. **comments** — The PR/MR's comment thread, fetched from the forge for any row whose branch has one
+
+The comparison base is the merge-base with the default branch, or with its upstream when the local default branch lags. The picker opens on **diff** for local rows and **pr** for a PR/MR listed by `--prs` but not available locally. `Tab` and `Shift-Tab` skip tabs without content; `Alt-1` through `Alt-8` open any tab directly. After you choose a tab, that choice stays active while you navigate.
 
 On narrow previews the tab bar compacts to digits — only the active tab keeps its label — so every `Alt-N` accelerator stays visible.
 
@@ -739,7 +758,7 @@ If the PR or MR is on a fork, the local branch uses its branch name directly, so
 
 The `--prs` flag adds the repository's open PRs (GitHub) or MRs (GitLab) to the interactive picker — only the ones not already there: a PR whose branch is already shown (as a worktree, or a local or remote branch) isn't listed twice, so `--prs` only adds the rest and the two pickers differ solely by those extra rows. Each added row resolves to the same `pr:`/`mr:` shortcut, so selecting one fetches the ref and switches to its branch. A `--prs` row has no local worktree, so its `pr` and `comments` preview tabs load the PR/MR's metadata and comments from the forge in the background. The `log` tab uses a local `git log` — graph and merge-base dimming included — whenever the head commit is already in the object store (a same-repo PR off a fetched remote), falling back to a flat forge-fetched commit list otherwise.
 
-Requires `gh` (GitHub), `glab` (GitLab), or an equivalent CLI installed and authenticated; see [forge platform](@/config.md#forge-platform) for Gitea, Azure DevOps, and other supported platforms.
+Requires `gh` (GitHub), `glab` (GitLab), or an equivalent CLI installed and authenticated; see [forge platform](/config/#forge-platform) for Gitea, Azure DevOps, and other supported platforms.
 
 ## When wt switch fails
 
@@ -751,9 +770,9 @@ To change which branch a worktree is on, use `git switch` inside that worktree.
 
 ## See also
 
-- [`wt list`](@/list.md) — View all worktrees
-- [`wt remove`](@/remove.md) — Delete worktrees when done
-- [`wt merge`](@/merge.md) — Integrate changes back to the default branch
+- [`wt list`](/list/) — View all worktrees
+- [`wt remove`](/remove/) — Delete worktrees when done
+- [`wt merge`](/merge/) — Integrate changes back to the default branch
 "#
     )]
     Switch(SwitchArgs),
@@ -776,13 +795,13 @@ List all worktrees:
 <!-- wt list -->
 ```console
 $ wt list
-  Branch       Status        HEAD±    main↕     main…±  Remote⇅  Commit   Age   Message
-@ feature-api  +   ↕⇡     +54   -5   ↑4  ↓1  +234  -24   ⇡3      6814f02  30m   Add API tests
-^ main             ^⇅                                    ⇡1  ⇣1  41ee083  4d    Merge fix-auth: h…
-+ fix-auth         ↕|                ↑2  ↓1   +25  -11     |     b772e68  5h    Add secure token…
-+ fix-typos        _|                                      |     41ee083  4d    Merge fix-auth: h…
+  Branch       Status      HEAD±     main↕    main…±    Remote⇅  Commit    Age  Message
+@ feature-api  +   ↕⇡     +54   -5   ↑4  ↓1  +234  -24   ⇡3      6814f02   30m  Add API tests
+^ main             ^⇅                                    ⇡1  ⇣1  41ee083    4d  Merge fix-auth: h…
++ fix-auth         ↕|                ↑2  ↓1   +25  -11     |     b772e68    5h  Add secure token…
++ fix-typos        _|                                      |     41ee083    4d  Merge fix-auth: h…
 
-○ Showing 4 worktrees, 1 with changes, 2 ahead, 1 column hidden
+○ Showing 4 worktrees, 1 with changes, 2 ahead, hidden: Path
 ```
 
 Include CI status and LLM summaries:
@@ -790,13 +809,13 @@ Include CI status and LLM summaries:
 <!-- wt list --full -->
 ```console
 $ wt list --full
-  Branch       Status        HEAD±    main↕     main…±  Summary                                                 Remote⇅  CI    Commit
-@ feature-api  +   ↕⇡     +54   -5   ↑4  ↓1  +234  -24  Refactor API to REST architecture with middleware        ⇡3      #412  6814f02
-^ main             ^⇅                                                                                            ⇡1  ⇣1  #     41ee083
-+ fix-auth         ↕|                ↑2  ↓1   +25  -11  Harden auth with constant-time token validation            |     #408  b772e68
-+ fix-typos        _|                                                                                              |     #410  41ee083
+  Branch       Status      HEAD±     main↕    main…±    Summary                      Remote⇅  CI
+@ feature-api  +   ↕⇡     +54   -5   ↑4  ↓1  +234  -24  Refactor API to REST archi…   ⇡3      #412
+^ main             ^⇅                                                                 ⇡1  ⇣1  #
++ fix-auth         ↕|                ↑2  ↓1   +25  -11  Harden auth with constant-…     |     #408
++ fix-typos        _|                                                                   |     #410
 
-○ Showing 4 worktrees, 1 with changes, 2 ahead, 3 columns hidden
+○ Showing 4 worktrees, 1 with changes, 2 ahead, hidden: Path, Commit, Age, Message
 ```
 
 Include branches that don't have worktrees:
@@ -804,15 +823,15 @@ Include branches that don't have worktrees:
 <!-- wt list --branches --full -->
 ```console
 $ wt list --branches --full
-  Branch       Status        HEAD±    main↕     main…±  Summary                                                 Remote⇅  CI    Commit
-@ feature-api  +   ↕⇡     +54   -5   ↑4  ↓1  +234  -24  Refactor API to REST architecture with middleware        ⇡3      #412  6814f02
-^ main             ^⇅                                                                                            ⇡1  ⇣1  #     41ee083
-+ fix-auth         ↕|                ↑2  ↓1   +25  -11  Harden auth with constant-time token validation            |     #408  b772e68
-+ fix-typos        _|                                                                                              |     #410  41ee083
-/ exp             /↕                 ↑2  ↓1  +137       Explore GraphQL schema and resolvers                                   9637922
-/ wip             /↕                 ↑1  ↓1   +33       Start API documentation                                                b40716d
+  Branch       Status      HEAD±     main↕    main…±    Summary                      Remote⇅  CI
+@ feature-api  +   ↕⇡     +54   -5   ↑4  ↓1  +234  -24  Refactor API to REST archi…   ⇡3      #412
+^ main             ^⇅                                                                 ⇡1  ⇣1  #
++ fix-auth         ↕|                ↑2  ↓1   +25  -11  Harden auth with constant-…     |     #408
++ fix-typos        _|                                                                   |     #410
+/ exp             /↕                 ↑2  ↓1  +137       Explore GraphQL schema and…
+/ wip             /↕                 ↑1  ↓1   +33       Start API documentation
 
-○ Showing 4 worktrees, 2 branches, 1 with changes, 4 ahead, 3 columns hidden
+○ Showing 4 worktrees, 2 branches, 1 with changes, 4 ahead, hidden: Path, Commit, Age, Message
 ```
 
 Output as JSON for scripting:
@@ -825,12 +844,12 @@ $ wt list --format=json
 
 | Column | Shows |
 |--------|-------|
-| Branch | Branch name; a detached worktree has none, so it shows its short hash in dim yellow |
+| Branch | Branch name, elided with `…` past 32 characters so one long name can't size the column for every row (`--format=json` keeps it whole); a detached worktree has none, so it shows its short hash in dim yellow |
 | Status | Compact symbols (see below) |
-| HEAD± | Uncommitted changes: +added -deleted lines |
+| HEAD± | Uncommitted changes, including untracked files: +added -deleted lines |
 | main↕ | Commits ahead/behind default branch |
 | main…± | Line diffs since the merge-base (three-dot) with the default branch |
-| Summary | LLM-generated branch summary; requires `--full`, `summary = true`, and [`commit.generation`](@/config.md#commit) [experimental] |
+| Summary | LLM-generated branch summary; requires `--full`, `summary = true`, and [`commit.generation`](/config/#commit) |
 | Remote⇅ | Commits ahead/behind tracking branch |
 | CI | PR/MR number colored by pipeline status; `--full` only |
 | Path | Worktree directory |
@@ -840,7 +859,9 @@ $ wt list --format=json
 | Age | Time since last commit |
 | Message | Last commit message (truncated) |
 
-The `main` header label is used regardless of the default branch's actual name.
+The `main↕` and `main…±` headers keep the familiar `main` label in every repository.
+
+The table sizes itself to the terminal. When the columns don't all fit, the least important go first — roughly right to left, since the order above runs from identity to nice-to-have — and the summary footer names them (`hidden: Commit, Age, Message`). A column with nothing to show on any row — `Remote⇅` in a repo with no remote — ranks below every populated column, so it goes first. A wider terminal brings them back. To pin a set rather than leave it to the width, name the columns in [`[list] columns`](/config/#list); `--format=json` carries every field at any width.
 
 `main↕` and `main…±` measure against the default branch's upstream tip when the local copy lags it — so in a fork whose local `main` trails `origin/main`, a branch reads as ahead of the real mainline, not of a stale local checkout. The `↑`/`↓`/`↕` Status symbols derive from these counts, so they track the upstream tip too.
 
@@ -858,7 +879,7 @@ The leftmost column marks each row by physical presence, from most present to le
 
 ### CI status
 
-The CI column shows the branch's open PR/MR — `#3035` on GitHub, Gitea, and Azure DevOps, `!3035` on GitLab — colored by pipeline status, or a bare `#` when no number is available (e.g. branch workflows without a PR/MR). One color folds two JSON fields: green/blue/red/yellow/gray are `ci.status`; magenta/cyan are `ci.review_state`. The `Value` column is the matching JSON string from `--format=json`:
+The CI column shows the branch's open PR/MR — `#3035` on GitHub, Gitea, and Azure DevOps, `!3035` on GitLab — colored by pipeline status, or a bare `#` when no number is available (e.g. branch workflows without a PR/MR). One color folds two JSON fields: green/blue/red/yellow/gray are the pipeline state, magenta/cyan the review state. The `Value` column names each state; [checks object](#checks-object) and [review states](#review-states) give the JSON spelling — schema 2 reports three of the pipeline values by the shape of `pr` and `checks` rather than as a `checks.status` string:
 
 | Indicator | Value | Meaning |
 |-----------|-------|---------|
@@ -870,87 +891,98 @@ The CI column shows the branch's open PR/MR — `#3035` on GitHub, Gitea, and Az
 | `⚠` yellow | `"error"` | CI status could not be fetched (rate limit, network, etc.) |
 | `#` magenta | `"changes_requested"` | A reviewer requested changes |
 | `#` cyan | `"pending"` | A review is required (e.g. branch protection) but not yet given |
-| (blank) | `ci` absent | No upstream, or no PR/MR and no branch workflow |
+| (blank) | `pr` and `checks` absent | No upstream, or no PR/MR and no branch workflow |
 
-The two remaining `ci.review_state` values have no indicator of their own: `"draft"` only dims the cell and `"approved"` leaves the color unchanged.
+The two remaining review states have no indicator of their own: `"draft"` only dims the cell and `"approved"` leaves the color unchanged.
 
-Color precedence resolves the fold: changes-requested (magenta) outranks running checks — waiting can't clear it — while an outstanding required review (cyan) only recolors an otherwise green or quiet branch. Cool colors mean waiting, warm colors mean act. An approved PR, or one with no review signal at all (no required reviewers and no reviews), keeps its plain `ci.status` color — `ci.review_state` is then `"approved"` or absent, respectively. GitLab MR data carries only `"pending"` and `"draft"` — no approved or changes-requested signal.
+Color precedence resolves the fold: changes-requested (magenta) outranks running checks — waiting can't clear it — while an outstanding required review (cyan) only recolors an otherwise green or quiet branch. Cool colors mean waiting, warm colors mean act. An approved PR, or one with no review signal at all (no required reviewers and no reviews), keeps its plain pipeline color — `pr.review` is then `"approved"` or absent, respectively. GitLab MR data carries only `"pending"` and `"draft"` — no approved or changes-requested signal.
 
-CI cells are clickable links to the PR or pipeline page, and appear dimmed for a draft PR/MR (`"draft"`) or when unpushed local changes make the status stale (`ci.stale`). PRs/MRs are checked first, then branch workflows/pipelines for branches with an upstream. Local-only branches show blank; remote-only branches — visible with `--remotes` — get CI status detection. Results are cached for 30-60 seconds; use `wt config state` to view or clear.
+CI cells are clickable links to the PR or pipeline page, and appear dimmed for a draft PR/MR (`"draft"`) or when unpushed local changes make the status stale (`checks.stale`). PRs/MRs are checked first, then branch workflows/pipelines for branches with an upstream. Local-only branches show blank; remote-only branches — visible with `--remotes` — get CI status detection. Results are cached for 30-60 seconds; use `wt config state cache` to view or clear.
 
-### LLM summaries [experimental]
+### LLM summaries
 
-Reuses the [`commit.generation`](@/config.md#commit) command — the same LLM that generates commit messages. Enable with `summary = true` in `[list]` config; requires `--full`. Results are cached until the branch's diff changes.
+Reuses the [`commit.generation`](/config/#commit) command — the same LLM that generates commit messages. Enable with `summary = true` in `[list]` config; requires `--full`. Results are cached until the branch's diff changes.
 
 ### Custom columns [experimental]
 
-Each `[list.custom-columns]` entry in user config adds a column: the key is the header, the template renders each row's cell. Templates read two per-branch namespaces — `{{ vars.* }}`, stored with [`wt config state vars set`](@/config.md#wt-config-state-vars), and `{{ git.branch.* }}`, the branch's own git config under `branch.<name>.*` (a `jira` key you set yourself, or the git-native `description`) — useful for tracking what each of many (often agent-driven) branches is for:
+Each `[list.custom-columns]` entry in user config adds a column: the key is the header, the template renders each row's cell. Templates read two per-branch namespaces — `{{ vars.* }}`, stored with [`wt config state vars set`](/config/#wt-config-state-vars), and `{{ git.branch.* }}`, the branch's own git config under `branch.<name>.*` (a `jira` key you set yourself, or the git-native `description`) — useful for tracking what each of many (often agent-driven) branches is for:
 
 ```toml
 [list.custom-columns.Ticket]
 template = "{{ vars.ticket }}"
 ```
 
-A column that renders empty for every row is dropped from the table. Templates, widths, and drop priority: [custom columns config](@/config.md#custom-columns).
+A custom column that renders empty for every row is dropped from the table outright, rather than merely ranked last as an empty built-in is. Templates, widths, and drop priority: [custom columns config](/config/#custom-columns).
 
 ## Status symbols
 
-The Status column packs several subcolumns, left to right, each mapping to a field in `--format=json`. Working-tree flags are independent and co-occur — any combination shows at once. The other subcolumns are mutually exclusive: each shows a single symbol, the highest-priority state in top-to-bottom table order, and is blank when nothing applies.
+The Status column packs several subcolumns, left to right, each mapping to a schema-2 field in `--format=json` (schema 1 spells several of them differently — see [Schema 1](#schema-1)). Working-tree flags are independent and co-occur — any combination shows at once. The other subcolumns are mutually exclusive: each shows a single symbol, the highest-priority state in top-to-bottom table order, and is blank when nothing applies.
 
 ### Working tree
 
-Independent flags from `git status`; several can show at once (e.g. `+!?`). Each maps to a boolean in the `working_tree` object:
+Independent flags from `git status`; several can show at once (e.g. `+!?`). Each maps to a boolean in the [changes object](#changes-object):
 
-| Symbol | working_tree | Meaning |
-|--------|--------------|---------|
+| Symbol | worktree.changes | Meaning |
+|--------|------------------|---------|
 | `+` | `staged` | Staged files |
 | `!` | `modified` | Modified files (unstaged) |
 | `?` | `untracked` | Untracked files |
 
-`working_tree` also reports `renamed` and `deleted`, which have no dedicated symbol in the column.
+`worktree.changes` also reports `renamed` and `deleted`, which have no dedicated symbol in the column.
 
 ### Worktree
 
-An in-progress git operation, a worktree-location attribute, or a branch with no worktree. One symbol shows, highest priority first (`✘ > ↻ > ⊟ > ⊞ > ⚑ > /`):
+An in-progress git operation, a worktree-location attribute, or a branch with no worktree. One symbol shows, highest priority first (`✘ > ↻ > ⊟ > ⊞ > ⊘ > ⚑ > /`):
 
 | Symbol | JSON | Meaning |
 |--------|------|---------|
-| `✘` | `operation_state` `"conflicts"` | Merge conflicts |
-| `↻` | `operation_state` `"rebase"`, `"merge"`, `"cherry_pick"`, `"revert"`, `"bisect"` | A git operation is in progress; `git status` names it |
-| `⊟` | `worktree.state` `"prunable"` | Prunable (worktree directory missing) |
-| `⊞` | `worktree.state` `"locked"` | Locked worktree |
-| `⚑` | `worktree.state` `"duplicate_branch"` | Branch checked out in more than one worktree, so `wt` resolves it to whichever git lists first; every worktree on the branch is flagged |
-| `⚑` | `worktree.state` `"branch_worktree_mismatch"` | Worktree isn't at the path its branch implies — including a detached one, which has no branch to imply a path and so is never at home |
-| `/` | `kind` `"branch"` | Branch without a worktree (no `worktree` object) |
+| `✘` | `worktree.changes.conflicted` | Merge conflicts |
+| `↻` | `worktree.operation` `"rebase"`, `"merge"`, `"cherry_pick"`, `"revert"`, `"bisect"` | A git operation is in progress; `git status` names it |
+| `⊟` | `worktree.prunable` | Prunable (worktree directory missing); nothing can be read from a directory that isn't there, so the row's data cells stay blank |
+| `⊞` | `worktree.locked` | Locked worktree |
+| `⊘` | `worktree.detached` | Detached HEAD — the worktree is on a commit, not a branch, which is why its Branch cell holds a short hash |
+| `⚑` | `worktree.duplicate_branch` | Branch checked out in more than one worktree, so `wt` resolves it to whichever git lists first; every worktree on the branch is flagged |
+| `⚑` | `worktree.branch_mismatch` | Worktree isn't at the path its branch implies |
+| `/` | no `worktree` object | Branch without a worktree |
 
 ### Default branch
 
-The single highest-priority state describing the branch's relation to the default branch; blank when none applies (a normal up-to-date branch). Each symbol is one `main_state` value:
+The single highest-priority state describing the branch's relation to the default branch; blank when none applies (a normal up-to-date branch). Each symbol is one `display.state` value:
 
-| Symbol | main_state | Meaning |
-|--------|------------|---------|
+| Symbol | display.state | Meaning |
+|--------|---------------|---------|
 | `^` | `"is_main"` | The main worktree (the repo's home worktree) |
 | `∅` | `"orphan"` | No common ancestor with the default branch |
 | `_` | `"empty"` | Same commit as the default branch, working tree clean — safe to remove; row dimmed |
-| `⊂` | `"integrated"` | Content [integrated](@/remove.md#branch-cleanup) into the default branch or merge target via different history; the matching check is in `integration_reason`; row dimmed |
-| `✗` | `"would_conflict"` | Merging into the default branch would conflict (simulated with `git merge-tree`) and the branch isn't already integrated; with `--full`, the check includes uncommitted changes |
+| `⊂` | `"integrated"` | Content [integrated](/remove/#branch-cleanup) into the default branch or merge target via different history; the matching check is in `default_branch.integration.reason`; row dimmed |
+| `✗` | `"would_conflict"` | Merging into the default branch would conflict (simulated with `git merge-tree`) and the branch isn't already integrated; with `--full`, the check includes tracked uncommitted changes |
 | `–` | `"same_commit"` | Same commit as the default branch, but with uncommitted changes |
 | `↕` | `"diverged"` | Both ahead of and behind the default branch |
 | `↑` | `"ahead"` | Has commits the default branch doesn't |
 | `↓` | `"behind"` | Missing commits the default branch has |
 
-Rows are dimmed when [safe to delete](@/remove.md#branch-cleanup) — `_` (`"empty"`) or `⊂` (`"integrated"`).
+Rows are dimmed when [safe to delete](/remove/#branch-cleanup) — `_` (`"empty"`) or `⊂` (`"integrated"`).
 
 ### Remote
 
-Relation to the tracking branch, derived from the `remote.ahead` / `remote.behind` counts; blank when there is no upstream:
+Relation to the tracking branch, derived from the `upstream.ahead` / `upstream.behind` counts; blank when there is no upstream:
 
-| Symbol | remote | Meaning |
-|--------|--------|---------|
+| Symbol | upstream | Meaning |
+|--------|----------|---------|
 | `\|` | `ahead` 0, `behind` 0 | In sync with remote |
 | `⇡` | `ahead` > 0 | Ahead of remote |
 | `⇣` | `behind` > 0 | Behind remote |
 | `⇅` | `ahead` > 0, `behind` > 0 | Diverged from remote |
+
+### Marker
+
+The last subcolumn carries the branch's own marker — whatever
+[`wt config state marker set`](/config/#wt-config-state-marker) stored, usually
+an emoji, which is why the subcolumn is two cells wide. Nothing in `wt` writes
+it; it is there for agents and scripts to say what a branch is for, and it
+reads back as the item's `marker` field. `wt config state marker set 🤖` on a
+branch whose default-branch state is `_` renders `_ 🤖` in the column and
+`"_🤖"` in `display.symbols`.
 
 ### Placeholder symbols
 
@@ -964,11 +996,8 @@ These appear across all columns while the table is loading:
 
 ## JSON output
 
-`--format=json` emits structured data in one of two schemas while the format
-migrates: `[list] json-schema = 2` selects the envelope format below, `= 1`
-the original bare-array format. Unset emits schema 1 with a warning
-(`wt config update` pins `= 1`); a future release flips the default to
-schema 2 and later removes schema 1.
+`--format=json` emits schema 2 by default: the envelope format below. Set
+`[list] json-schema = 1` to retain the original bare-array format.
 
 ### Schema 2
 
@@ -1016,117 +1045,61 @@ How "no value" reads:
 jq treats absent and `null` identically in path expressions, so filters need
 no null checks; `has()` distinguishes the two when it matters.
 
-Item fields:
-
-| Field | Description |
-|-------|-------------|
-| `branch` | Branch name; null for a detached-HEAD worktree. Remote rows carry the bare name with the remote in `remote` |
-| `remote` | Remote name, present only on remote-only branch rows |
-| `head` | `{sha, short_sha, subject, committed_at}`; null for unborn branches. `committed_at` is RFC 3339 UTC |
-| `worktree` | `{path, main, current, previous, detached, locked, prunable, branch_mismatch, duplicate_branch, operation, changes}`; absent on branch-only rows. `locked`/`prunable` are `{reason}` objects and can co-occur; `operation` is `"rebase"` or `"merge"`; `changes` holds the five working-tree flags plus `conflicted` and `diff {added, deleted}` |
-| `default_branch` | Relation to the default branch: `{ahead, behind, diff, orphan, integration, merge_conflicts}`; absent on the default branch itself. `integration.reason` is one of `same_commit`, `ancestor`, `no_added_changes`, `trees_match`, `merge_adds_nothing`, `patch_id_match`; a dirty tree skips the checks, leaving `integration` null |
-| `upstream` | Tracking branch: `{remote, branch, ahead, behind}`; absent when none is configured |
-| `pr` | Open PR/MR: `{number, url, review, mergeable, repo}`; collected with `--full`. `review` uses the schema 1 `ci.review_state` vocabulary; `mergeable` is false when the forge reports conflicts, null otherwise |
-| `checks` | CI pipeline: `{status, source, stale}`; collected with `--full`. `status` is `passed`, `running`, or `failed` — null when a conflicts report masks it |
-| `dev_server` | `{url, listening}` from the project's `list.url` template |
-| `summary` | LLM branch summary; needs `--full`, `[list] summary = true`, and a `[commit.generation]` command |
-| `vars` | Per-branch variables from [`wt config state vars`](@/config.md#wt-config-state-vars) |
-| `display` | Rendered strings: `state` (schema 1's `main_state` vocabulary), `symbols`, `statusline` (with ANSI colors and OSC 8 hyperlinks), `columns` (custom-column cells keyed by header) |
-
-Schema 1 names map directly: `commit` → `head`, `working_tree` →
-`worktree.changes`, `main` + `main_state` → `default_branch` +
-`display.state`, `remote` → `upstream`, `ci` → `pr` + `checks`, `url` +
-`url_active` → `dev_server`, `statusline`/`symbols`/`columns` → `display.*`,
-and the per-item `repo` moves to the envelope's `repo.forge`.
-
-```console
-# Current worktree path (for scripts)
-$ wt list --format=json | jq -r '.items[] | select(.worktree.current) | .worktree.path'
-
-# Branches with uncommitted changes
-$ wt list --format=json | jq '.items[] | select(.worktree.changes.modified)'
-
-# Integrated branches (safe to remove)
-$ wt list --format=json | jq '.items[] | select(.display.state == "integrated" or .display.state == "empty") | .branch'
-
-# Worktrees ahead of upstream (needs pushing)
-$ wt list --format=json | jq '.items[] | select(.upstream.ahead > 0) | .branch'
-```
-
-A JSON Schema for the envelope is published at
-[worktrunk.dev/schema/list-v2.json](https://worktrunk.dev/schema/list-v2.json).
-It describes what `wt` writes, so a field the absence rule can omit is
-optional there rather than required-and-null.
-
-### Schema 1
-
-The original bare-array format, and the default while unset:
-
-```console
-# Current worktree path (for scripts)
-$ wt list --format=json | jq -r '.[] | select(.is_current) | .path'
-
-# Branches with uncommitted changes
-$ wt list --format=json | jq '.[] | select(.working_tree.modified)'
-
-# Worktrees with merge conflicts
-$ wt list --format=json | jq '.[] | select(.operation_state == "conflicts")'
-
-# Branches ahead of main (needs merging)
-$ wt list --format=json | jq '.[] | select(.main.ahead > 0) | .branch'
-
-# Integrated branches (safe to remove)
-$ wt list --format=json | jq '.[] | select(.main_state == "integrated" or .main_state == "empty") | .branch'
-
-# Branches without worktrees
-$ wt list --format=json --branches | jq '.[] | select(.kind == "branch") | .branch'
-
-# Worktrees ahead of remote (needs pushing)
-$ wt list --format=json | jq '.[] | select(.remote.ahead > 0) | {branch, ahead: .remote.ahead}'
-
-# Stale CI (local changes not reflected in CI)
-$ wt list --format=json --full | jq '.[] | select(.ci.stale) | .branch'
-```
-
-**Fields:**
+Envelope fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `branch` | string/null | Branch name (null for detached HEAD) |
-| `path` | string | Worktree path (absent for branches without worktrees) |
-| `kind` | string | `"worktree"` or `"branch"` |
-| `commit` | object | Commit info (see below) |
-| `working_tree` | object | Working tree state (see below) |
-| `main_state` | string | Relation to the default branch (see below) |
-| `integration_reason` | string | Why branch is integrated (see below) |
-| `operation_state` | string | `"conflicts"`, `"rebase"`, or `"merge"` (see [Worktree](#worktree)); absent when clean |
-| `main` | object | Relationship to the default branch (see below); absent when is_main |
-| `remote` | object | Tracking branch info (see below); absent when no tracking |
-| `worktree` | object | Worktree metadata (see below) |
-| `is_main` | boolean | Is the main worktree |
-| `is_current` | boolean | Is the current worktree |
-| `is_previous` | boolean | Previous worktree from wt switch |
-| `ci` | object | CI status (see below); `--full` only, then absent when no PR/MR or branch workflow |
-| `repo_url` | string | Repository web URL derived from the primary remote; absent when the remote URL cannot be parsed |
-| `repo` | object | Structured repository metadata (see below); includes `remote` |
-| `url` | string | Dev server URL from project config; absent when not configured |
-| `url_active` | boolean | Whether the URL's port is listening; absent when not configured |
-| `summary` | string | LLM-generated branch summary; `--full` only, then absent when not configured or no summary |
-| `statusline` | string | Pre-formatted status with colors and links |
-| `symbols` | string | Raw status symbols without colors (e.g., `"!?↓"`) |
-| `vars` | object | Per-branch variables from [`wt config state vars`](@/config.md#wt-config-state-vars) (absent when empty) |
-| `columns` | object | Rendered [custom column](#custom-columns) values keyed by header; empty cells omitted (absent when none configured) |
+| `schema` | number | Format version; always `2` |
+| `repo` | object | `{default_branch, forge}` — the branch every `default_branch` object measures against (absent when detection failed), and forge metadata derived from the primary remote (absent when no remote URL parses; see [repo object](#repo-object)) |
+| `collected` | object | `{ci, summary}` — which gated fact families this run requested, so an absent `pr`/`checks`/`summary` reads as "not requested" rather than "none" |
+| `items` | array | One object per row: a worktree, a local branch, or a remote-only branch |
 
-### Commit object
+Item fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `branch` | string/null | Branch name; null for a detached-HEAD worktree. Remote rows carry the bare name with the remote in `remote` |
+| `remote` | string | Remote name, present only on remote-only branch rows |
+| `head` | object/null | HEAD commit (see [head object](#head-object)); null for unborn branches |
+| `worktree` | object | Worktree facts (see [worktree object](#worktree-object)); absent on branch-only rows |
+| `default_branch` | object | Relation to the default branch (see [default_branch object](#default-branch-object)); absent on the default branch itself |
+| `upstream` | object | Tracking branch (see [upstream object](#upstream-object)); absent when none is configured |
+| `pr` | object | Open PR/MR (see [pr object](#pr-object)); collected with `--full` |
+| `checks` | object | CI pipeline (see [checks object](#checks-object)); collected with `--full` |
+| `dev_server` | object | `{url, listening}` from the project's `list.url` template; absent when not configured |
+| `summary` | string | LLM branch summary; needs `--full`, `[list] summary = true`, and a `[commit.generation]` command |
+| `marker` | string | Branch marker from [`wt config state marker`](/config/#wt-config-state-marker); absent when none is set |
+| `vars` | object | Per-branch variables from [`wt config state vars`](/config/#wt-config-state-vars) |
+| `display` | object | Rendered strings (see [display object](#display-object)) |
+
+### head object
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `sha` | string | Full commit SHA (40 chars) |
 | `short_sha` | string | Short commit SHA, abbreviated per `core.abbrev` (auto-extends for ambiguous prefixes) |
-| `message` | string | Commit message (first line) |
-| `timestamp` | number | Unix timestamp |
+| `subject` | string/null | Commit subject (first line); null when not loaded, as for a prunable worktree |
+| `committed_at` | string/null | Committer time, RFC 3339 UTC; null when not loaded |
 
-### working_tree object
+### worktree object
+
+Present only on worktree rows. The location attributes are independent, so they co-occur — see [Worktree](#worktree) for the symbols, which pick one:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `path` | string | Worktree path |
+| `main` | boolean | Is the main worktree |
+| `current` | boolean | Is the worktree the command ran from |
+| `previous` | boolean | Is the previous worktree (`wt switch -`) |
+| `detached` | boolean | HEAD is detached |
+| `locked` | object | `{reason}`; absent when not locked |
+| `prunable` | object | `{reason}`; absent when git doesn't report the worktree prunable |
+| `branch_mismatch` | boolean | Worktree isn't at the path its branch implies |
+| `duplicate_branch` | boolean | Another worktree has the same branch checked out |
+| `operation` | string/null | In-progress operation: `"merge"`, `"rebase"`, `"cherry_pick"`, `"revert"`, `"bisect"`; absent when none |
+| `changes` | object/null | Working-tree state (see [changes object](#changes-object)) |
+
+### changes object
 
 The five change flags map to the [Working tree](#working-tree) symbols (`renamed` and `deleted` have none of their own):
 
@@ -1137,53 +1110,74 @@ The five change flags map to the [Working tree](#working-tree) symbols (`renamed
 | `untracked` | boolean | Has untracked files |
 | `renamed` | boolean | Has renamed files |
 | `deleted` | boolean | Has deleted files |
-| `diff` | object | Lines changed vs HEAD: `{added, deleted}` |
+| `conflicted` | boolean/null | Tracked files carry merge conflicts |
+| `diff` | object/null | Lines changed vs HEAD: `{added, deleted}` |
 
-### main object
+### default_branch object
+
+Independent facts; the table's priority-collapsed symbol is `display.state`.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `ahead` | number | Commits ahead of the default branch |
-| `behind` | number | Commits behind the default branch |
-| `diff` | object | Lines changed vs the default branch: `{added, deleted}` |
+| `ahead` | number/null | Commits ahead of the default branch (null for orphans) |
+| `behind` | number/null | Commits behind the default branch (null for orphans) |
+| `diff` | object/null | Lines changed vs the default branch: `{added, deleted}` |
+| `orphan` | boolean/null | No common ancestor with the default branch |
+| `integration` | object/null | `{reason}` — which check found the content [integrated](/remove/#branch-cleanup) (see [integration reasons](#integration-reasons)); absent when determined not-integrated, null when a dirty tree skipped the checks |
+| `merge_conflicts` | boolean/null | Merging into the default branch would conflict, simulated locally with `git merge-tree` |
 
-### remote object
+### upstream object
 
 `ahead` / `behind` drive the [Remote](#remote) divergence symbol:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `name` | string | Remote name (e.g., `"origin"`) |
-| `branch` | string | Remote branch name |
+| `remote` | string | Remote name (e.g., `"origin"`) |
+| `branch` | string/null | Branch name on the remote |
 | `ahead` | number | Commits ahead of remote |
 | `behind` | number | Commits behind remote |
 
-### worktree object
-
-Present only for worktree-kind items. `state` is the worktree-location attribute — see [Worktree](#worktree) for its symbols:
+### pr object
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `state` | string | `"branch_worktree_mismatch"`, `"duplicate_branch"`, `"prunable"`, or `"locked"` (absent when normal) |
-| `reason` | string | Reason for locked/prunable state |
-| `detached` | boolean | HEAD is detached |
+| `number` | integer/null | PR/MR number |
+| `url` | string/null | URL to the PR/MR page |
+| `review` | string | Review state (see [review states](#review-states)); absent when the forge reports no review signal |
+| `mergeable` | boolean/null | False when the forge reports conflicts, null otherwise — the fetch records only the conflicted case |
+| `repo` | object | Structured metadata for the repository the PR/MR targets, the upstream for fork PRs (see [repo object](#repo-object)); absent when the URL doesn't parse |
 
-### ci object
+### checks object
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | string | CI status (see below) |
+| `status` | string/null | `"passed"`, `"running"`, or `"failed"`; null when a conflicts report masks it |
 | `source` | string | `"pr"` (PR/MR) or `"branch"` (branch workflow) |
-| `number` | integer | PR/MR number; absent for branch workflows |
 | `stale` | boolean | Local HEAD differs from remote (unpushed changes) |
-| `url` | string | URL to the PR/MR page |
-| `repo_url` | string | Web URL of the repo the PR/MR targets (the upstream for fork PRs); absent when `url` is absent or unrecognized |
-| `repo` | object | Structured metadata for the repository the PR/MR targets; never includes `remote` |
-| `review_state` | string | Review state (see below); absent when the forge reports no review signal |
+
+Three [CI status](#ci-status) values have no `checks.status` of their own, because the shape of `pr` and `checks` reports them: a fetch error (`⚠`) makes both null, no CI leaves `checks` absent, and merge conflicts leave `checks.status` null with `pr.mergeable` false.
+
+### dev_server object
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `url` | string | Dev server URL from project config |
+| `listening` | boolean/null | Whether the URL's port is listening |
+
+### display object
+
+Presentation only — every value here renders facts that appear elsewhere in the item:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `state` | string | The table's collapsed default-branch state (see [state values](#state-values)); absent when none applies |
+| `symbols` | string | Raw status symbols without colors (e.g., `"!?↓"`) |
+| `statusline` | string | Pre-formatted status with colors and links |
+| `columns` | object | Rendered [custom column](#custom-columns) values keyed by header; empty cells omitted |
 
 ### repo object
 
-Top-level `repo` describes the local checkout's repository as derived from the primary remote. `ci.repo` describes the repository targeted by the PR/MR URL in `ci.url` (for fork PRs, this is the upstream target). Existing `repo_url` and `ci.repo_url` fields remain available and carry the same URL as `repo.url` / `ci.repo.url`.
+`repo.forge` describes the local checkout's repository as derived from the primary remote. `pr.repo` describes the repository targeted by the PR/MR (for fork PRs, the upstream target).
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -1193,33 +1187,99 @@ Top-level `repo` describes the local checkout's repository as derived from the p
 | `owner` | string | Owner, organization, or namespace path |
 | `name` | string | Repository name |
 | `project` | string | Azure DevOps project name; absent for other providers |
-| `remote` | string | Local remote name used for top-level repo metadata; absent from `ci.repo` |
+| `remote` | string | Local remote name; present on `repo.forge`, absent from `pr.repo` |
 
-### main_state values
+### state values
 
 The single highest-priority state describing the branch's relation to the default branch; absent when none applies (a normal up-to-date branch). Each value is one Default-branch symbol — see [Default branch](#default-branch) for the symbol and the full meaning of each value (`"is_main"`, `"orphan"`, `"empty"`, `"integrated"`, `"would_conflict"`, `"same_commit"`, `"diverged"`, `"ahead"`, `"behind"`).
 
-### integration_reason values
+### integration reasons
 
-Set only when `main_state == "integrated"` (the `⊂` symbol), recording which check matched. Checks run cheapest-first and the first match wins. JSON-only — every reason renders as the same `⊂`:
+`default_branch.integration.reason` records which check matched. Checks run cheapest-first and the first match wins. JSON-only — every reason renders as the same `⊂`:
 
 | Value | Meaning |
 |-------|---------|
+| `"same_commit"` | Branch HEAD is the default branch's commit |
 | `"ancestor"` | Branch HEAD is an ancestor of the default branch, which has moved past it |
-| `"no-added-changes"` | The three-dot diff (`main...branch`) is empty — no file changes beyond the merge-base |
-| `"trees-match"` | Different history, but the branch's tree is identical to the default branch's |
-| `"merge-adds-nothing"` | The branch has changes, but merging them leaves the default branch's tree unchanged (e.g. a squash merge where the target advanced on other files) |
-| `"patch-id-match"` | The branch's squashed diff matches a single commit on the default branch (e.g. a GitHub/GitLab squash merge) |
+| `"no_added_changes"` | The three-dot diff (`main...branch`) is empty — no file changes beyond the merge-base |
+| `"trees_match"` | Different history, but the branch's tree is identical to the default branch's |
+| `"merge_adds_nothing"` | The branch has changes, but merging them leaves the default branch's tree unchanged (e.g. a squash merge where the target advanced on other files) |
+| `"patch_id_match"` | The branch's squashed diff matches a single commit on the default branch (e.g. a GitHub/GitLab squash merge) |
 
-### ci.status and ci.review_state values
+### review states
 
-The [CI status](#ci-status) section above is the single source for both fields: the table maps each colored value, and the notes below it cover `"draft"` and `"approved"`. `ci.status` is one of `"passed"`, `"running"`, `"failed"`, `"conflicts"`, `"no-ci"`, `"error"`; `ci.review_state` is one of `"changes_requested"`, `"pending"`, `"draft"`, `"approved"`, absent when the forge reports no review signal. The vocabulary matches Claude Code's statusline `pr.review_state` field.
+`pr.review` is one of `"changes_requested"`, `"pending"`, `"draft"`, `"approved"`, absent when the forge reports no review signal. The [CI status](#ci-status) section is the single source: its table maps the colored values, and the notes below it cover `"draft"` and `"approved"`. The vocabulary matches Claude Code's statusline `pr.review_state` field.
+
+```console
+# Current worktree path (for scripts)
+$ wt list --format=json | jq -r '.items[] | select(.worktree.current) | .worktree.path'
+
+# Branches with uncommitted changes
+$ wt list --format=json | jq '.items[] | select(.worktree.changes.modified)'
+
+# Worktrees with merge conflicts
+$ wt list --format=json | jq '.items[] | select(.worktree.changes.conflicted)'
+
+# Branches ahead of main (needs merging)
+$ wt list --format=json | jq '.items[] | select(.default_branch.ahead > 0) | .branch'
+
+# Integrated branches (safe to remove)
+$ wt list --format=json | jq '.items[] | select(.display.state == "integrated" or .display.state == "empty") | .branch'
+
+# Branches without worktrees
+$ wt list --format=json --branches | jq '.items[] | select(.worktree == null) | .branch'
+
+# Worktrees ahead of upstream (needs pushing)
+$ wt list --format=json | jq '.items[] | select(.upstream.ahead > 0) | {branch, ahead: .upstream.ahead}'
+
+# Stale CI (local changes not reflected in CI)
+$ wt list --format=json --full | jq '.items[] | select(.checks.stale) | .branch'
+```
+
+A JSON Schema for the envelope is published at
+[worktrunk.dev/schema/list-v2.json](https://worktrunk.dev/schema/list-v2.json).
+It describes what `wt` writes, so a field the absence rule can omit is
+optional there rather than required-and-null.
+
+### Schema 1
+
+The original bare-array format — one object per row, no envelope — selected by
+`[list] json-schema = 1`. Its fields all have a schema-2 home:
+
+| Schema 1 | Schema 2 |
+|----------|----------|
+| `branch` | `branch` |
+| `path` | `worktree.path` |
+| `kind` | the row's shape — a `worktree` object means `"worktree"`, no `worktree` object means `"branch"` |
+| `commit.sha`, `.short_sha`, `.message` | `head.sha`, `.short_sha`, `.subject` |
+| `commit.timestamp` (Unix) | `head.committed_at` (RFC 3339 UTC) |
+| `working_tree.staged`, `.modified`, `.untracked`, `.renamed`, `.deleted`, `.diff` | `worktree.changes.*` |
+| `operation_state` `"conflicts"` | `worktree.changes.conflicted` |
+| `operation_state` `"rebase"`, `"merge"`, … | `worktree.operation` |
+| `main_state` | `display.state` |
+| `integration_reason` | `default_branch.integration.reason` (snake_case, and it reports `"same_commit"` rather than folding it into `main_state`) |
+| `main.ahead`, `.behind`, `.diff` | `default_branch.ahead`, `.behind`, `.diff` |
+| `remote.name`, `.branch`, `.ahead`, `.behind` | `upstream.remote`, `.branch`, `.ahead`, `.behind` |
+| `worktree.state` | `worktree.locked`, `.prunable`, `.duplicate_branch`, `.branch_mismatch` — independent, so they co-occur |
+| `worktree.reason` | `worktree.locked.reason`, `worktree.prunable.reason` |
+| `worktree.detached` | `worktree.detached` |
+| `is_main`, `is_current`, `is_previous` | `worktree.main`, `.current`, `.previous` |
+| `ci.status` | `checks.status`, plus the shapes described under [checks object](#checks-object) |
+| `ci.source`, `ci.stale` | `checks.source`, `checks.stale` |
+| `ci.number`, `ci.url`, `ci.review_state` | `pr.number`, `pr.url`, `pr.review` |
+| `ci.repo`, `ci.repo_url` | `pr.repo`, `pr.repo.url` |
+| `repo`, `repo_url` | the envelope's `repo.forge`, `repo.forge.url` |
+| `url`, `url_active` | `dev_server.url`, `dev_server.listening` |
+| `summary`, `vars`, `marker` | `summary`, `vars`, `marker` |
+| `statusline`, `symbols`, `columns` | `display.statusline`, `display.symbols`, `display.columns` |
+
+The envelope's `repo.default_branch` and `collected` have no schema-1 equivalent, and schema 2 separates "nothing to report" from "not determined" — see [How "no value" reads](#schema-2).
 
 Missing a field that would be generally useful? Open an issue at https://github.com/max-sixty/worktrunk.
 
 ## See also
 
-- [`wt switch`](@/switch.md) — Switch worktrees or open interactive picker
+- [`wt switch`](/switch/) — Switch worktrees or open interactive picker
 <!-- subdoc: statusline -->"#
     )]
     // TODO: `args_conflicts_with_subcommands` causes confusing errors for unknown
@@ -1325,7 +1385,7 @@ $ wt remove --reap feature
 To avoid killing work the user did not mean to kill, two guards keep `--reap` conservative:
 
 - **Interactive processes are spared.** A process holding a controlling terminal — an interactive shell, or a terminal editor such as `vim` with unsaved buffers — is never reaped. Only detached processes remain candidates.
-- **Discovery is by working directory only.** A process that started in the worktree and later changed directory, or a daemon that reparented to `init`, no longer reports a directory under the worktree and is not found. To reliably reap those, launch them with [`wt step tether`](@/step.md#wt-step-tether), which kills the whole process group when the worktree is removed.
+- **Discovery is by working directory only.** A process that started in the worktree and later changed directory, or a daemon that reparented to `init`, no longer reports a directory under the worktree and is not found. To reliably reap those, launch them with [`wt step tether`](/step/#wt-step-tether), which kills the whole process group when the worktree is removed.
 
 Reaping runs before the worktree directory is touched, so it is independent of foreground/background removal and the `--force` flag. Unix only; on Windows `--reap` is rejected.
 
@@ -1347,7 +1407,7 @@ Reaping runs before the worktree directory is touched, so it is independent of f
 
 ## Hooks
 
-`pre-remove` hooks run before the worktree is deleted (with access to worktree files). `post-remove` hooks run after removal. See [`wt hook`](@/hook.md) for configuration.
+`pre-remove` hooks run before the worktree is deleted (with access to worktree files). `post-remove` hooks run after removal. See [`wt hook`](/hook/) for configuration.
 
 ## Detached HEAD worktrees
 
@@ -1355,8 +1415,8 @@ Detached worktrees have no branch name. Pass the worktree path instead: `wt remo
 
 ## See also
 
-- [`wt merge`](@/merge.md) — Remove worktree after merging
-- [`wt list`](@/list.md) — View all worktrees
+- [`wt merge`](/merge/) — Remove worktree after merging
+- [`wt list`](/list/) — View all worktrees
 "#)]
     Remove(RemoveArgs),
 
@@ -1421,11 +1481,11 @@ $ wt merge --no-commit
 
 `wt merge` runs these steps:
 
-1. **Commit** — Pre-commit hooks run, then uncommitted changes are committed. Post-commit hooks run in background. Skipped when squashing (the default) — changes are staged during the squash step instead. With `--no-squash`, this is the only commit step.
+1. **Commit** — Pre-commit hooks run, then uncommitted changes are committed. Post-commit hooks run in the background; when step 7 removes the worktree they are anchored on, the merge reports them rather than running them. This step is skipped when squashing (the default) — changes are staged during the squash step instead. With `--no-squash`, this is the only commit step.
 2. **Squash** — Combines all commits since target into one (like GitHub's "Squash and merge"). Use `--stage` to control what gets staged: `all` (default), `tracked`, or `none`. Working-tree changes swept into the squash are backed up first to `refs/wt-backup/<branch>`. With `--no-squash`, individual commits are preserved.
-3. **Rebase** — Rebases onto target, skipping when nothing needs replaying ([`wt step rebase`](@/step.md#wt-step-rebase) gives the conditions). A conflict stops the merge with the rebase left open in the worktree, to resolve or abort. With `--no-rebase`, the graph produced by earlier commit/squash steps is preserved and the target must be able to fast-forward to its tip.
-4. **Pre-merge hooks** — Hooks run after rebase, before merge. Failures abort. See [`wt hook`](@/hook.md).
-5. **Merge** — Fast-forward merge to the target branch ([`wt step push`](@/step.md#wt-step-push)). With `--no-ff`, a merge commit is created instead — semi-linear history after the default rebase, while explicit `--no-rebase` preserves the graph produced by earlier steps before adding the merge commit. Non-fast-forward merges are rejected.
+3. **Rebase** — Rebases onto target, skipping when nothing needs replaying ([`wt step rebase`](/step/#wt-step-rebase) gives the conditions). A conflict stops the merge with the rebase left open in the worktree, to resolve or abort. With `--no-rebase`, the graph produced by earlier commit/squash steps is preserved and the target must be able to fast-forward to its tip.
+4. **Pre-merge hooks** — Hooks run after rebase, before merge. Failures abort. See [`wt hook`](/hook/).
+5. **Merge** — Fast-forward merge to the target branch ([`wt step push`](/step/#wt-step-push)). With `--no-ff`, a merge commit is created instead — semi-linear history after the default rebase, while explicit `--no-rebase` preserves the graph produced by earlier steps before adding the merge commit. Non-fast-forward merges are rejected.
 6. **Pre-remove hooks** — Hooks run before removing worktree. Failures abort.
 7. **Cleanup** — Removes the worktree and branch. Use `--no-remove` to keep the worktree. When already on the target branch or in the primary worktree, the worktree is preserved.
 8. **Post-remove + post-merge hooks** — Run in background after cleanup.
@@ -1450,9 +1510,9 @@ lint = "cargo clippy"
 
 ## See also
 
-- [`wt step`](@/step.md) — Run individual operations (commit, squash, rebase, push)
-- [`wt remove`](@/remove.md) — Remove worktrees without merging
-- [`wt switch`](@/switch.md) — Navigate to other worktrees
+- [`wt step`](/step/) — Run individual operations (commit, squash, rebase, push)
+- [`wt remove`](/remove/) — Remove worktrees without merging
+- [`wt switch`](/switch/) — Navigate to other worktrees
 "#
     )]
     Merge(MergeArgs),
@@ -1499,25 +1559,25 @@ $ wt step push
 
 ## Operations
 
-- [`commit`](#wt-step-commit) — Stage and commit with [LLM-generated message](@/llm-commits.md)
-- [`squash`](#wt-step-squash) — Squash all branch commits into one with [LLM-generated message](@/llm-commits.md)
+- [`commit`](#wt-step-commit) — Stage and commit with [LLM-generated message](/llm-commits/)
+- [`squash`](#wt-step-squash) — Squash all branch commits into one with [LLM-generated message](/llm-commits/)
 - [`rebase`](#wt-step-rebase) — Rebase onto target branch
 - [`push`](#wt-step-push) — Fast-forward target to current branch
 - [`diff`](#wt-step-diff) — Show all changes since branching (committed, staged, unstaged, untracked)
 - [`copy-ignored`](#wt-step-copy-ignored) — Copy gitignored files between worktrees
-- [`eval`](#wt-step-eval) — [experimental] Evaluate a template expression
-- [`for-each`](#wt-step-for-each) — [experimental] Run a command in every worktree
+- [`eval`](#wt-step-eval) — Evaluate a template expression
+- [`for-each`](#wt-step-for-each) — Run a command in every worktree
 - [`promote`](#wt-step-promote) — [experimental] Swap a branch into the main worktree
 - [`prune`](#wt-step-prune) — Remove worktrees and branches merged into the default branch
 - [`relocate`](#wt-step-relocate) — [experimental] Move worktrees to expected paths
 - [`tether`](#wt-step-tether) — [experimental] Run a command; kill its whole process tree when its worktree is removed
-- [`<alias>`](@/extending.md#aliases) — Run a configured command alias
+- [`<alias>`](/extending/#aliases) — Run a configured command alias
 
 ## See also
 
-- [`wt merge`](@/merge.md) — Runs commit → squash → rebase → hooks → push → cleanup automatically
-- [`wt hook`](@/hook.md) — Run configured hooks
-- [Aliases](@/extending.md#aliases) — Custom command templates run as `wt <name>`
+- [`wt merge`](/merge/) — Runs commit → squash → rebase → hooks → push → cleanup automatically
+- [`wt hook`](/hook/) — Run configured hooks
+- [Aliases](/extending/#aliases) — Custom command templates run as `wt <name>`
 <!-- subdoc: commit -->
 <!-- subdoc: squash -->
 <!-- subdoc: rebase -->
@@ -1551,7 +1611,7 @@ $ wt step push
 | **merge** | `pre-merge` | `post-merge` |
 | **remove** | `pre-remove` | `post-remove` |
 
-`pre-*` hooks block — failure aborts the operation. `post-*` hooks run in the background with output logged (use [`wt config state logs`](@/config.md#wt-config-state-logs) to find and manage log files). Use `-v` to see the template variables for background hooks; `wt hook <type> --dry-run` previews the commands.
+`pre-*` hooks block — failure aborts the operation. `post-*` hooks run in the background with output logged (use [`wt config state logs`](/config/#wt-config-state-logs) to find and manage log files); `wt hook <type> --foreground` runs one inline instead, so its output arrives in the terminal. Use `-v` to see the template variables for background hooks; `wt hook <type> --dry-run` previews the commands.
 
 The most common creation hook is `post-start` — it runs background tasks (dev servers, file copying, builds) without blocking worktree creation. Prefer `post-start` over `pre-start` unless a later step needs the work completed first.
 
@@ -1561,14 +1621,14 @@ The most common creation hook is `post-start` — it runs background tasks (dev 
 | `post-switch` | Triggers on all switch results: creating, switching to existing, or staying on current |
 | `pre-start` | Runs once when a new worktree is created, blocking `post-start`/`--execute` until complete: dependency install, env file generation |
 | `post-start` | Runs once when a new worktree is created, in the background: dev servers, long builds, file watchers, copying caches |
-| `pre-commit` | Formatters, linters, type checking — runs during `wt merge` before the squash commit |
+| `pre-commit` | Formatters, linters, type checking — runs before any Worktrunk commit (`wt step commit`, `wt step squash`, and the commit `wt merge` makes) |
 | `post-commit` | CI triggers, notifications, background linting |
 | `pre-merge` | Tests, security scans, build verification — runs after rebase, before merge to target |
 | `post-merge` | Deployment, notifications, installing updated binaries. Runs in the target branch worktree if it exists, otherwise the primary worktree |
 | `pre-remove` | Cleanup before worktree deletion: saving test artifacts, backing up state. Runs in the worktree being removed |
 | `post-remove` | Stopping dev servers, removing containers, notifying external systems. Template variables reference the removed worktree |
 
-During `wt merge`, hooks run in this order: pre-commit → post-commit → pre-merge → pre-remove → post-remove + post-merge. See [`wt merge`](@/merge.md#pipeline) for the complete pipeline.
+During `wt merge`, the blocking hooks run in this order: pre-commit → pre-merge → pre-remove. The `post-*` hooks all start together once the merge finishes, each in the worktree it is anchored on — post-merge, post-switch and post-remove in the destination, post-commit in the worktree the commit was made in. A merge that removes that worktree reports `post-commit` as skipped instead of running it — the worktree is gone by the time the hook would start. Use `pre-remove` for work that must finish there, or `--no-remove` to keep the worktree. See [`wt merge`](/merge/#pipeline) for the complete pipeline.
 
 # Security
 
@@ -1591,7 +1651,7 @@ Project commands require approval on first run:
 - If a command changes, new approval is required
 - Declining skips every project command for that operation — including any already approved — and continues without them; saved approvals are unaffected
 - Use `--yes` to bypass prompts — useful for CI and automation
-- Use `--no-hooks` to skip hooks
+- Use `--no-hooks` to skip hooks — accepted by the commands that run them (`wt switch`, `wt merge`, `wt remove`, `wt step commit`, `wt step squash`), not by `wt hook`
 
 Manage approvals with `wt config approvals add` and `wt config approvals clear`.
 
@@ -1630,7 +1690,7 @@ server = "npm run dev"
 
 Here `install` runs first, then `build` and `server` run together.
 
-Templates are syntax-checked before the pipeline starts and rendered as each step runs, so a step can store [per-branch vars](@/config.md#wt-config-state-vars) that later steps read via `{{ vars.<key> }}`. Because an earlier step can still change those values, a preview leaves them alone: `wt hook <type> --dry-run` and `wt hook show --expanded` render `{{ vars.<key> }}` as itself while every other variable expands.
+Templates are syntax-checked before the pipeline starts and rendered as each step runs, so a step can store [per-branch vars](/config/#wt-config-state-vars) that later steps read via `{{ vars.<key> }}`. Because an earlier step can still change those values, a preview stands the reference in for its value instead of resolving it: `wt hook <type> --dry-run` and `wt hook show --expanded` render `{{ vars.thing | default('none') }}` as `{{ vars.thing }}` — the reference is defined, so the `default` never fires — while every other variable expands. A filter that transforms its input still runs, against the placeholder text: `{{ vars.thing | upper }}` previews as `{{ VARS.THING }}`.
 
 Most hooks don't need `[[hook]]` blocks. Reach for them when there's a dependency chain — typically setup that must complete before later steps, like installing dependencies before running a build and dev server concurrently.
 
@@ -1639,11 +1699,13 @@ Most hooks don't need `[[hook]]` blocks. Reach for them when there's a dependenc
 | Aspect | Project hooks | User hooks |
 |--------|--------------|------------|
 | Location | `.config/wt.toml` | `~/.config/worktrunk/config.toml` |
-| Scope | Single repository | All repositories (or [per-project](@/config.md#user-project-specific-settings)) |
+| Scope | Single repository | All repositories (or [per-project](/config/#user-project-specific-settings)) |
 | Approval | Required | Not required |
-| Execution order | After user hooks | First |
+| Execution order | `pre-*`: after user hooks. `post-*`: alongside them | `pre-*`: first. `post-*`: alongside project hooks |
 
-Skip all hooks with `--no-hooks`. To run a specific hook when user and project both define the same name, use `user:name` or `project:name` syntax.
+To run a specific hook when user and project both define the same name, use `user:name` or `project:name` syntax.
+
+A `pre-*` hook blocks the command, so both sources run as one pipeline: user commands first, and a failure there skips the project's. A `post-*` hook runs in the background, where each source is its own detached pipeline — they start together, neither waits for the other, and a failure in one leaves the other running. Order within a source is still yours to set with `[[hook]]` blocks; across `post-*` sources there is none. Two `post-*` hooks that write the same file, or run `git` in the same worktree, will race, so put commands that depend on each other in one source.
 
 ## Template variables
 
@@ -1651,7 +1713,7 @@ Hooks can use template variables that expand at runtime:
 
 | Kind | Variable | Description |
 |------|----------|-------------|
-| active    | `{{ branch }}`                | Branch name |
+| active    | `{{ branch }}`                | Branch name; unset in a detached worktree |
 |           | `{{ worktree_path }}`         | Worktree path |
 |           | `{{ worktree_name }}`         | Worktree directory name |
 |           | `{{ commit }}`                | Branch HEAD SHA |
@@ -1661,8 +1723,8 @@ Hooks can use template variables that expand at runtime:
 |           | `{{ base_worktree_path }}`    | Base worktree path |
 |           | `{{ target }}`                | Target branch name |
 |           | `{{ target_worktree_path }}`  | Target worktree path (when target has a worktree) |
-|           | `{{ pr_number }}`             | PR/MR number (post-switch, pre-start, post-start; when creating via `pr:N` / `mr:N`) |
-|           | `{{ pr_url }}`                | PR/MR web URL (post-switch, pre-start, post-start; when creating via `pr:N` / `mr:N`) |
+|           | `{{ pr_number }}`             | PR/MR number (switch and create hooks; when switching via `pr:N` / `mr:N`) |
+|           | `{{ pr_url }}`                | PR/MR web URL (switch and create hooks; when switching via `pr:N` / `mr:N`) |
 | repo      | `{{ repo }}`                  | Repository directory name |
 |           | `{{ repo_path }}`             | Absolute path to repository root |
 |           | `{{ owner }}`                 | Primary remote owner path (may include subgroups) |
@@ -1675,7 +1737,7 @@ Hooks can use template variables that expand at runtime:
 |           | `{{ hook_type }}`             | Hook type being run (e.g. `pre-start`, `pre-merge`) |
 |           | `{{ hook_name }}`             | Hook command name (if named) |
 |           | `{{ args }}`                  | Tokens forwarded from the CLI — see [Running Hooks Manually](#running-hooks-manually) |
-| user      | `{{ vars.<key> }}`            | Per-branch variables from [`wt config state vars`](@/config.md#wt-config-state-vars) |
+| user      | `{{ vars.<key> }}`            | Per-branch variables from [`wt config state vars`](/config/#wt-config-state-vars) |
 
 The `repo` variables (`repo`, `repo_path`, `owner`, `remote_repo`, `primary_worktree_path`, `default_branch`, `remote`, `remote_url`) are constant across the whole repository — `default_branch` is the same in every worktree. The `active` variables (`branch`, `worktree_path`, `worktree_name`, `commit`, `short_commit`, `upstream`) vary per worktree.
 
@@ -1692,7 +1754,7 @@ All hooks share the same perspective — `{{ branch | hash_port }}` produces the
 
 `cwd` is the worktree root where the hook command runs. It equals `worktree_path` except in three cases:
 
-- `pre-switch`: hook runs in the source worktree; `worktree_path` is the destination
+- `pre-switch`: hook runs in the source worktree; `worktree_path` is the destination when that worktree already exists — a switch that creates one has no destination directory yet, so `worktree_path` stays on the source (use `pre-start` to work in the new worktree)
 - `post-remove`: the active worktree is gone, so the hook runs in the primary worktree
 - `post-merge` with removal: the active worktree is gone, so the hook runs in the target worktree
 
@@ -1700,9 +1762,11 @@ Undefined variables error — use conditionals or defaults for optional behavior
 
 ```toml
 [pre-start]
-# Rebase onto upstream if tracking a remote branch (e.g., wt switch --create feature origin/feature)
+# Rebase onto upstream if tracking a remote branch (e.g., wt switch --create feature --base origin/feature)
 sync = "{% if upstream %}git fetch && git rebase {{ upstream }}{% endif %}"
 ```
+
+A detached worktree is on no branch, so `branch` is undefined there — as are the `base` and `target` names derived from it, whether by a manual `wt hook` or by an operation whose source or destination worktree is detached (`base` in a `pre-switch` fired from one, `target` in a removal that lands in one) — and the same `{% if branch %}` guard applies. This matches `wt list --format=json`, which reports `branch: null` for the same worktree.
 
 Run any hook-firing command with `-v` to see the resolved variables for the actual invocation — each hook prints a `template variables:` block showing every in-scope variable and its value (`(unset)` for conditional vars that didn't populate, like `target_worktree_path` during `wt switch -`). Aliases do the same under `-v`: `wt -v <alias>` prints the alias's in-scope variables before the pipeline runs.
 
@@ -1728,18 +1792,7 @@ Templates support Jinja2 filters for transforming values:
 | `basename` | `{{ repo_path \| basename }}` | Keep only the last path component (`/a/b/c` → `c`) |
 | `codename(n)` | `{{ branch \| codename(2) }}` | Deterministic friendly words |
 
-The `sanitize_db` filter produces database-safe identifiers — lowercase alphanumeric and underscores, no leading digits, with a 3-character hash suffix to avoid collisions and reserved words. The `sanitize_hash` filter produces a filesystem-safe name and appends a 3-character hash suffix when sanitization changed the input, so distinct originals never collide — already-safe names pass through unchanged. The `codename(n)` filter produces deterministic friendly names from an input string: `codename(1)` returns a noun, `codename(2)` returns `adjective-noun`, and higher counts add more adjectives. The pool is large (~1.26M combinations for `codename(2)`), so it usually stands alone as a worktree leaf:
-
-```toml
-# Friendly branch-derived worktree names, e.g. myproject.malleable-opah
-worktree-path = "{{ repo_path }}/../{{ repo }}.{{ branch | codename(2) }}"
-```
-
-When you want both a friendly name and the original branch identity in the path, put the branch name in a parent directory:
-
-```toml
-worktree-path = "{{ repo_path }}/../worktrees/{{ branch | sanitize }}/{{ branch | codename(2) }}"
-```
+The `sanitize_db` filter produces database-safe identifiers — lowercase alphanumeric and underscores, no leading digits, with a 3-character hash suffix to avoid collisions and reserved words. The `sanitize_hash` filter produces a filesystem-safe name and appends a 3-character hash suffix when sanitization changed the input, so distinct originals never collide — already-safe names pass through unchanged. The `codename(n)` filter produces deterministic friendly names from an input string: `codename(1)` returns a noun, `codename(2)` returns `adjective-noun`, and higher counts add more adjectives. The pool is large (~1.26M combinations for `codename(2)`), so it usually stands alone as a worktree leaf — the [`worktree-path` recipes](/config/#worktree-path-template) show it both alone and under a branch-named parent directory.
 
 The `hash` filter is the bare 3-character base36 digest, useful for composing your own truncate-with-collision-avoidance recipes when an output budget is tight (e.g., Unix socket paths capped at 107 bytes):
 
@@ -1789,7 +1842,7 @@ setup = "cp {{ worktree_path_of_branch('main') }}/config.local {{ worktree_path 
 
 ## JSON context
 
-Hooks receive all template variables as JSON on stdin, enabling complex logic that templates can't express:
+Hooks receive all template variables as JSON on stdin, enabling complex logic that templates can't express. Variables that are unset in a template are absent from the JSON too, so read the optional ones with a default — `branch` has none in a detached worktree:
 
 ```toml
 [pre-start]
@@ -1799,13 +1852,13 @@ setup = "python3 scripts/pre-start-setup.py"
 ```python
 import json, sys, subprocess
 ctx = json.load(sys.stdin)
-if ctx['branch'].startswith('feature/') and 'backend' in ctx['repo']:
+if ctx.get('branch', '').startswith('feature/') and 'backend' in ctx['repo']:
     subprocess.run(['make', 'seed-db'])
 ```
 
 ## Copying untracked files
 
-One specific command worth calling out: [`wt step copy-ignored`](@/step.md#wt-step-copy-ignored). Git worktrees share the repository but not untracked files, and this copies gitignored files between worktrees:
+One specific command worth calling out: [`wt step copy-ignored`](/step/#wt-step-copy-ignored). Git worktrees share the repository but not untracked files, and this copies gitignored files between worktrees:
 
 ```toml
 [post-start]
@@ -1866,18 +1919,18 @@ The long form `--var KEY=VALUE` is deprecated but still supported. It force-bind
 
 # Recipes
 
-- [Eliminate cold starts](@/tips-patterns.md#eliminate-cold-starts): `wt step copy-ignored` in `post-start` shares build caches and dependencies; use a `[[post-start]]` pipeline when a later hook depends on the copy
-- [Dev server per worktree](@/tips-patterns.md#dev-server-per-worktree): `wt step tether` in `post-start` runs the dev server and kills its whole process group when the worktree is removed, with optional subdomain routing
-- [Database per worktree](@/tips-patterns.md#database-per-worktree): a `post-start` pipeline stores container name, port, and connection string as [per-branch vars](@/config.md#wt-config-state-vars) that later hooks reference
-- [Progressive validation](@/tips-patterns.md#progressive-validation): quick lint/typecheck in `pre-commit`, expensive tests and builds in `pre-merge`
-- [Target-specific hooks](@/tips-patterns.md#target-specific-hooks): branch on `{{ target }}` in `post-merge` for per-environment deploys
+- [Eliminate cold starts](/tips-patterns/#eliminate-cold-starts): `wt step copy-ignored` in `post-start` shares build caches and dependencies; use a `[[post-start]]` pipeline when a later hook depends on the copy
+- [Dev server per worktree](/tips-patterns/#dev-server-per-worktree): `wt step tether` in `post-start` runs the dev server and kills its whole process group when the worktree is removed, with optional subdomain routing
+- [Database per worktree](/tips-patterns/#database-per-worktree): a `post-start` pipeline stores container name, port, and connection string as [per-branch vars](/config/#wt-config-state-vars) that later hooks reference
+- [Progressive validation](/tips-patterns/#progressive-validation): quick lint/typecheck in `pre-commit`, expensive tests and builds in `pre-merge`
+- [Target-specific hooks](/tips-patterns/#target-specific-hooks): branch on `{{ target }}` in `post-merge` for per-environment deploys
 
 ## See also
 
-- [`wt merge`](@/merge.md) — Runs hooks automatically during merge
-- [`wt switch`](@/switch.md) — Runs pre-start/post-start hooks on `--create`
-- [`wt config approvals`](@/config.md#wt-config-approvals) — Manage approvals
-- [`wt config state logs`](@/config.md#wt-config-state-logs) — Access background hook logs
+- [`wt merge`](/merge/) — Runs hooks automatically during merge
+- [`wt switch`](/switch/) — Runs pre-start/post-start hooks on `--create`
+- [`wt config approvals`](/config/#wt-config-approvals) — Manage approvals
+- [`wt config state logs`](/config/#wt-config-state-logs) — Access background hook logs
 "#
     )]
     Hook {
@@ -1969,7 +2022,7 @@ Controls where new worktrees are created.
 - `{{ branch | sanitize_db }}` — database-safe: lowercase, underscores, hash suffix (e.g., `feature_auth_x7k`)
 - `{{ branch | codename(2) }}` — deterministic friendly name from a ~1.26M-combo pool (e.g., `malleable-opah`)
 
-This is a smaller set than [the variables hooks and aliases get](@/hook.md#template-variables).
+This is a smaller set than [the variables hooks and aliases get](/hook/#template-variables).
 
 **Examples** for repo at `~/code/myproject`, branch `feature/auth`:
 
@@ -2009,7 +2062,7 @@ By remote owner path (`~/development/max-sixty/myproject/feature/auth`):
 worktree-path = "~/development/{{ owner }}/{{ repo }}/{{ branch }}"
 ```
 
-Bare repository (`~/code/myproject/feature-auth`):
+Bare repository cloned to `~/code/myproject/.git` (`~/code/myproject/feature-auth`):
 
 ```toml
 worktree-path = "{{ repo_path }}/../{{ branch | sanitize }}"
@@ -2056,7 +2109,7 @@ command = "llm -m claude-haiku-4.5"
 command = "aichat -m claude:claude-haiku-4.5"
 ```
 
-See [LLM commits docs](@/llm-commits.md) for setup and [Custom prompt templates](#custom-prompt-templates) for template customization.
+See [LLM commits docs](/llm-commits/) for setup and [Custom prompt templates](#custom-prompt-templates) for template customization.
 
 ## Command config
 
@@ -2072,7 +2125,7 @@ full = false       # Show CI status and LLM summaries (--full)
 branches = false   # Include branches without worktrees (--branches)
 remotes = false    # Include remote-only branches (--remotes)
 
-json-schema = 1    # JSON output schema: 1 (current, bare array) or 2 (envelope); unset emits 1 with a warning
+json-schema = 2    # JSON output schema: 2 (envelope, default) or 1 (bare array)
 
 columns = ["branch", "status", "ci", "path"]   # Columns to show, in order — built-ins or custom headers (omit for the default set)
 
@@ -2082,7 +2135,7 @@ timeout-ms = 0     # Wall-clock budget for the entire collect phase; 0 disables
 `columns` selects and orders the columns the `wt list` table and the `wt switch`
 picker render; `--format json` ignores it and always emits every field. Omit it
 for the default set. It is meant to drive a per-invocation
-[alias](@/extending.md#aliases) (`wt --config-set 'list.columns=[…]' list`),
+[alias](/extending/#aliases) (`wt --config-set 'list.columns=[…]' list`),
 giving a named view without disturbing the default `wt list`. A static setting
 works but pins one layout over a table that otherwise adapts to `--full` and
 terminal width.
@@ -2091,7 +2144,7 @@ Valid built-in names:
 
 - `branch` — The branch name
 - `status` — Git status symbols, plus any user-defined status
-- `working-diff` — Uncommitted line changes against `HEAD` (header `HEAD±`)
+- `working-diff` — Uncommitted line changes against `HEAD`, including untracked files (header `HEAD±`)
 - `ahead-behind` — Commits ahead of and behind the default branch (header `main↕`)
 - `branch-diff` — Line changes against the default branch (header `main…±`)
 - `summary` — An LLM-generated summary of the branch
@@ -2134,7 +2187,7 @@ Templates may reference `{{ branch }}`, `{{ worktree_path }}`,
 namespaces:
 
 - `{{ vars.* }}` — values stored with
-  [`wt config state vars set`](@/config.md#wt-config-state-vars).
+  [`wt config state vars set`](/config/#wt-config-state-vars).
 - `{{ git.branch.* }}` — the branch's own git config under `branch.<name>.*`,
   read straight from `git config` (e.g. `{{ git.branch.jira }}` for a key you
   set yourself, or the git-native `description`). Git lowercases config variable
@@ -2143,7 +2196,8 @@ namespaces:
 All standard filters work (`sanitize`, `hash_port`, `codename`, …). A row
 where the template renders empty (e.g. a branch without the key) shows an
 empty cell; a column that is empty for every row is dropped from the table.
-`wt list --format json` includes the rendered values under `columns`.
+`wt list --format json` includes the rendered values under
+`items[].display.columns` in schema 2, or under `columns` in schema 1.
 
 A `Jira` column reading a key kept in git config, and a `Summary` column
 showing just the first line of the git-native branch description:
@@ -2205,11 +2259,11 @@ pager = "delta --paging=never"   # Example: override git's core.pager for diff p
 exclude = []   # Additional excludes (e.g., [".cache/", ".turbo/"])
 ```
 
-Built-in excludes always apply: VCS metadata directories (`.bzr/`, `.hg/`, `.jj/`, `.pijul/`, `.sl/`, `.svn/`) and tool-state directories (`.conductor/`, `.entire/`, `.worktrees/`). User config and project config exclusions are combined.
+Built-in excludes (VCS metadata and tool-state directories) always apply; [the `wt step copy-ignored` docs](/step/#wt-step-copy-ignored) list them. User config and project config exclusions are combined.
 
 ### Aliases
 
-Command templates that run as `wt <name>`. See the [Extending Worktrunk guide](@/extending.md#aliases) for usage and flags.
+Command templates that run as `wt <name>`. See the [Extending Worktrunk guide](/extending/#aliases) for usage and flags.
 
 ```toml
 [aliases]
@@ -2217,15 +2271,15 @@ greet = "echo Hello from {{ branch }}"
 url = "echo http://localhost:{{ branch | hash_port }}"
 ```
 
-Aliases defined here apply to all projects. For project-specific aliases, use the [project config](@/config.md#project-configuration) `[aliases]` section instead.
+Aliases defined here apply to all projects. For project-specific aliases, use the [project config](/config/#project-configuration) `[aliases]` section instead.
 
 ### User project-specific settings
 
-User config can include a `[projects]` table for project-specific settings — worktree layout, setting overrides, anything else — separate from the [project config](@/config.md#project-configuration) shared with teammates.
+User config can include a `[projects]` table for project-specific settings — worktree layout, setting overrides, anything else — separate from the [project config](/config/#project-configuration) shared with teammates.
 
 Entries are keyed by project identifier — `<host>/<owner>/<repo>` derived from the primary remote URL (no `.git` suffix), or the canonical repo path when there is no remote. Run `wt config show` inside the repo to see the identifier for the current project; it appears in the `PROJECT CONFIG` section as `Identifier: …`.
 
-Scalar values (like `worktree-path`) replace the global value; everything else (hooks, aliases, etc.) appends, global first. See [how the layers rank](@/config.md#precedence).
+Scalar values (like `worktree-path`) replace the global value; everything else (hooks, aliases, etc.) appends, global first. See [how the layers rank](/config/#precedence).
 
 ```toml
 [projects."github.com/user/repo"]
@@ -2258,7 +2312,7 @@ Every matching entry applies, least- to most-specific, following the rule above:
 
 #### Forge platform and hostname
 
-`forge` names the forge for the matched repositories — the user-level counterpart of the project config's [forge platform](@/config.md#forge-platform) block, for a self-hosted host whose name carries no `github`, `gitlab`, or `gitea` for detection to read.
+`forge` names the forge for the matched repositories — the user-level counterpart of the project config's [forge platform](/config/#forge-platform) block, for a self-hosted host whose name carries no `github`, `gitlab`, or `gitea` for detection to read.
 
 ```toml
 [projects."git.company.example/*"]
@@ -2268,7 +2322,7 @@ forge.hostname = "api.git.company.example"   # API host, when the remote's own h
 
 Both fields describe the host rather than the repository, which is why a pattern keyed to a hostname suits them, and why an SSH alias resolved through `~/.ssh/config` — where the name in the remote URL is local to one machine — belongs here rather than in a repository's committed config. A repository's own `[forge]` block still wins over any entry here, field by field: a repository that sets only `platform` still takes a matching entry's `hostname`.
 
-Hooks support all three [hook forms](@/hook.md#hook-forms). A table runs multiple commands concurrently; an array-of-tables pipeline runs steps in sequence. The dotted-key examples below are equivalent to the table forms — TOML treats `projects."github.com/user/repo".post-start.server = "..."` and a `[projects."github.com/user/repo".post-start]` table the same way:
+Hooks support all three [hook forms](/hook/#hook-forms). A table runs multiple commands concurrently; an array-of-tables pipeline runs steps in sequence. The dotted-key examples below are equivalent to the table forms — TOML treats `projects."github.com/user/repo".post-start.server = "..."` and a `[projects."github.com/user/repo".post-start]` table the same way:
 
 ```toml
 # Single command
@@ -2300,7 +2354,7 @@ Available variables:
 - `{{ git_diff }}`, `{{ git_diff_stat }}` — diff content
 - `{{ branch }}`, `{{ repo }}` — context
 - `{{ recent_commits }}` — recent commit messages
-- `{{ user_guidance }}`, `{{ project_guidance }}` — rendered append fragments (see [Appending to the prompt](@/config.md#appending-to-the-prompt))
+- `{{ user_guidance }}`, `{{ project_guidance }}` — rendered append fragments (see [Appending to the prompt](/config/#appending-to-the-prompt))
 
 Default template:
 
@@ -2400,7 +2454,7 @@ squash-template = """
 ```
 <!-- DEFAULT_SQUASH_TEMPLATE_END -->
 
-#### Appending to the prompt [experimental]
+#### Appending to the prompt
 
 `template-append` adds to the prompt instead of replacing it. The value is rendered as its own minijinja template (same variables) and injected into the default templates' `{{ user_guidance }}` slot — a `<user-guidance>` block right after `<style>`. It applies to both commit and squash. Use it for personal preferences without restating the whole template:
 
@@ -2411,11 +2465,11 @@ template-append = """
 """
 ```
 
-The [project config](@/config.md#project-configuration) has a `template-append` of its own; it renders into a separate `<project-guidance>` block right after `<user-guidance>`.
+How the fragment renders, and the project-config counterpart: [the LLM commits guide](/llm-commits/#appending-to-the-prompt).
 
 ## Hooks
 
-See [`wt hook`](@/hook.md) for hook types, execution order, template variables, and examples. User hooks apply to all projects; [project hooks](@/config.md#project-configuration) apply only to that repository.
+See [`wt hook`](/hook/) for hook types, execution order, template variables, and examples. User hooks apply to all projects; [project hooks](/config/#project-configuration) apply only to that repository.
 <!-- USER_CONFIG_END -->
 <!-- PROJECT_CONFIG_START -->
 # Project Configuration
@@ -2426,7 +2480,7 @@ To create a starter file with commented-out examples, run `wt config create --pr
 
 ## Hooks
 
-Project hooks apply to this repository only. See [`wt hook`](@/hook.md) for hook types, execution order, and examples.
+Project hooks apply to this repository only. See [`wt hook`](/hook/) for hook types, execution order, and examples.
 
 ```toml
 pre-start = "npm ci"
@@ -2453,9 +2507,9 @@ platform = "github"  # or "gitlab", "gitea" (experimental), "azure-devops" (expe
 hostname = "github.example.com"  # Example: API host (GHE / self-hosted GitLab)
 ```
 
-When many repositories share one self-hosted host, name it once in user config with a [pattern-keyed `[projects]` entry](@/config.md#user-project-specific-settings) instead of repeating this block in each repo. A repository's own `[forge]` still wins, field by field.
+When many repositories share one self-hosted host, name it once in user config with a [pattern-keyed `[projects]` entry](/config/#user-project-specific-settings) instead of repeating this block in each repo. A repository's own `[forge]` still wins, field by field.
 
-## Commit-message append [experimental]
+## Commit-message append
 
 Project-wide commit-message conventions appended to the LLM commit and squash prompts inside a `<project-guidance>` block, after the main template's `<style>` section (and after any user `<user-guidance>`). Rendered as a [minijinja](https://docs.rs/minijinja/) template with the same variables as the main commit template (`{{ branch }}`, `{{ git_diff }}`, etc.), so it can reference them directly. The first time the fragment changes, `wt` prompts the user to approve it — the same one-shot gate as project-defined hooks.
 
@@ -2467,7 +2521,7 @@ template-append = """
 """
 ```
 
-Only `template-append` is honored from the project file. The LLM command and the main prompt template stay in [user config](@/config.md) — they describe per-developer environment (which CLI is installed, which agent the developer prefers). User config has a `[commit.generation] template-append` of its own; it renders into a separate `<user-guidance>` block immediately before this one.
+The first time the fragment is used (and whenever it changes), `wt` prompts the user to approve it — the same one-shot gate as project-defined hooks. Only `template-append` is honored from the project file; the LLM command and the main prompt template stay in [user config](/config/), since they describe per-developer environment (which CLI is installed, which agent the developer prefers). How the fragment renders: [the LLM commits guide](/llm-commits/#appending-to-the-prompt).
 
 ## Copy-ignored excludes
 
@@ -2478,11 +2532,11 @@ Additional excludes for `wt step copy-ignored`:
 exclude = [".cache/", ".turbo/"]
 ```
 
-Built-in excludes always apply: VCS metadata directories (`.bzr/`, `.hg/`, `.jj/`, `.pijul/`, `.sl/`, `.svn/`) and tool-state directories (`.conductor/`, `.entire/`, `.worktrees/`). User config and project config exclusions are combined.
+Built-in excludes (VCS metadata and tool-state directories) always apply; [the `wt step copy-ignored` docs](/step/#wt-step-copy-ignored) list them. User config and project config exclusions are combined.
 
 ## Aliases
 
-Command templates that run as `wt <name>`. See the [Extending Worktrunk guide](@/extending.md#aliases) for usage and flags.
+Command templates that run as `wt <name>`. See the [Extending Worktrunk guide](/extending/#aliases) for usage and flags.
 
 ```toml
 [aliases]
@@ -2490,7 +2544,7 @@ deploy = "make deploy BRANCH={{ branch }}"
 url = "echo http://localhost:{{ branch | hash_port }}"
 ```
 
-Aliases defined here are shared with teammates. For personal aliases, use the [user config](@/config.md#aliases) `[aliases]` section instead.
+Aliases defined here are shared with teammates. For personal aliases, use the [user config](/config/#aliases) `[aliases]` section instead.
 <!-- PROJECT_CONFIG_END -->
 
 # Shell Integration
@@ -2545,9 +2599,7 @@ $ WORKTRUNK_COMMIT__GENERATION__COMMAND="echo 'test: automated commit'" wt merge
 | `WORKTRUNK_PROJECT_CONFIG_PATH` | Override project config file location (defaults to `.config/wt.toml`) |
 | `XDG_CONFIG_DIRS` | Colon-separated system config directories (default: `/etc/xdg`) |
 | `WORKTRUNK_DIRECTIVE_CD_FILE` | Internal: set by shell wrappers. wt writes a raw path; the wrapper `cd`s to it |
-| `WORKTRUNK_DIRECTIVE_EXEC_FILE` | Internal: set by shell wrappers. wt writes shell commands; the wrapper sources the file |
 | `WORKTRUNK_SHELL_CWD` | Internal: set by wt on alias and hook bodies, so a nested `wt` preserves the user's subdirectory |
-| `WORKTRUNK_SHELL` | Internal: set by shell wrappers to indicate shell type (e.g., `powershell`) |
 | `WORKTRUNK_COMPLETE_NAME` | Internal: set by shell wrappers to the command name completions register under (defaults to the binary name) |
 | `WORKTRUNK_MAX_CONCURRENT_COMMANDS` | Max parallel git commands (default: 32). Lower if hitting file descriptor limits. |
 | `WORKTRUNK_VERBOSE` | Verbosity level (`0`/`1`/`2`), like `-v`/`-vv` but applied everywhere — including shell completion, which no flag can reach |
@@ -2568,7 +2620,7 @@ This composes with aliases — an alias body can invoke `wt --config-set … <co
 
 ## Precedence
 
-Sources closer to the invocation rank higher (user config above system config), and within a config file a [project entry](@/config.md#user-project-specific-settings) outranks the global key of the same name. So `worktree-path` comes from the first of these that sets it:
+Sources closer to the invocation rank higher (user config above system config), and within a config file a [project entry](/config/#user-project-specific-settings) outranks the global key of the same name. So `worktree-path` comes from the first of these that sets it:
 
 1. `--config-set 'worktree-path = …'`
 2. `WORKTRUNK_WORKTREE_PATH`
@@ -2583,6 +2635,7 @@ $ wt --config-set 'projects."github.com/owner/repo".worktree-path = "/tmp/scratc
 
 Hooks, aliases and `step.copy-ignored.exclude` accumulate rather than replace, so an env-set hook and a project's hook both run.
 <!-- subdoc: show -->
+<!-- subdoc: update -->
 <!-- subdoc: approvals -->
 <!-- subdoc: alias -->
 <!-- subdoc: state -->"#)]

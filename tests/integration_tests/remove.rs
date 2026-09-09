@@ -1,6 +1,6 @@
 use crate::common::{
-    BareRepoTest, SLEEP_FOR_ABSENCE_CHECK, TestRepo, TestRepoBase, configure_directive_files,
-    directive_files, make_snapshot_cmd, repo, repo_with_remote, setup_snapshot_settings,
+    BareRepoTest, SLEEP_FOR_ABSENCE_CHECK, TestRepo, TestRepoBase, configure_directive_file,
+    directive_file, make_snapshot_cmd, repo, repo_with_remote, setup_snapshot_settings,
     setup_temp_snapshot_settings, wt_command,
 };
 use ansi_str::AnsiStr;
@@ -212,10 +212,10 @@ fn test_remove_internal_mode(mut repo: TestRepo) {
     let worktree_path = repo.add_worktree("feature-internal");
 
     // Directive file guards must live through command execution
-    let (cd_path, exec_path, _guard) = directive_files();
+    let (cd_path, _guard) = directive_file();
     assert_cmd_snapshot!({
         let mut cmd = make_snapshot_cmd(&repo, "remove", &[], Some(&worktree_path));
-        configure_directive_files(&mut cmd, &cd_path, &exec_path);
+        configure_directive_file(&mut cmd, &cd_path);
         cmd
     });
 }
@@ -596,7 +596,12 @@ fn test_remove_refuses_foreign_repository_at_worktree_path(mut repo: TestRepo) {
 /// test never depends on how git derives the id.
 fn registration_dir(worktree: &Path) -> PathBuf {
     let dot_git = std::fs::read_to_string(worktree.join(".git")).unwrap();
-    PathBuf::from(dot_git.trim().strip_prefix("gitdir: ").unwrap())
+    let path = PathBuf::from(dot_git.trim().strip_prefix("gitdir: ").unwrap());
+    if path.is_relative() {
+        worktree.join(path)
+    } else {
+        path
+    }
 }
 
 /// A registration whose directory now holds a *sibling worktree of the same
@@ -698,38 +703,32 @@ approved-commands = ['{hook}']
     );
 }
 
-/// A registration recording its worktree with a *relative* `gitdir` entry is
-/// recognized, and that worktree removes normally.
+/// A registration using Git's configured path format is recognized and the
+/// worktree removes normally.
 ///
-/// git writes the relative form under `worktree.useRelativePaths` and resolves
-/// either, so the gate resolves an entry against the registration directory as
-/// git does. Rewriting the entry rather than setting the config keeps this
-/// independent of the git version that introduced the option — and git reads the
-/// rewritten entry back, which is what makes it the same form git would write.
+/// Git 2.48 and newer honor `worktree.useRelativePaths` and enable the
+/// `extensions.relativeWorktrees` repository extension. Older supported Git
+/// versions ignore the setting and keep writing absolute registrations. A
+/// hand-written relative entry would be unusable on Git 2.43, so Git creates
+/// the entry: this exercises the relative form where supported and the absolute
+/// form on older versions.
 #[rstest]
-fn test_remove_worktree_with_relative_registration_gitdir(mut repo: TestRepo) {
+fn test_remove_worktree_with_git_generated_registration_paths(mut repo: TestRepo) {
+    repo.run_git(&["config", "worktree.useRelativePaths", "true"]);
     let worktree_path = repo.add_worktree("feature");
     let registration = registration_dir(&worktree_path);
-
-    // From `<repo>/.git/worktrees/<id>`, four levels up is the directory the
-    // worktree sits in, under the default `../{{ repo }}.{{ branch }}` layout.
-    let relative = Path::new("../../../..")
-        .join(worktree_path.file_name().unwrap())
-        .join(".git");
+    let gitdir = std::fs::read_to_string(registration.join("gitdir")).unwrap();
+    let relative_extension_enabled = repo
+        .git_command()
+        .args(["config", "--get", "extensions.relativeWorktrees"])
+        .run()
+        .unwrap()
+        .status
+        .success();
     assert_eq!(
-        dunce::canonicalize(registration.join(&relative)).unwrap(),
-        dunce::canonicalize(worktree_path.join(".git")).unwrap(),
-        "the relative entry must resolve to this worktree's own .git",
-    );
-    std::fs::write(
-        registration.join("gitdir"),
-        relative.to_slash_lossy().as_ref(),
-    )
-    .unwrap();
-    assert!(
-        repo.git_output(&["worktree", "list", "--porcelain"])
-            .contains(&worktree_path.to_slash_lossy().to_string()),
-        "git must still resolve the worktree from the relative entry",
+        Path::new(gitdir.trim()).is_relative(),
+        relative_extension_enabled,
+        "Git must write a relative registration exactly when it enables the repository extension",
     );
 
     assert_cmd_snapshot!(make_snapshot_cmd(
@@ -2491,13 +2490,13 @@ approved-commands = ["exit 1"]
     let worktree_path = repo.add_worktree("feature-cd-test");
 
     // Set up directive files
-    let (cd_path, exec_path, _guard) = directive_files();
+    let (cd_path, _guard) = directive_file();
 
     // Run remove from within the worktree (which would trigger cd to main if it worked)
     let mut cmd = repo.wt_command();
     cmd.args(["remove", "--foreground"]);
     cmd.current_dir(&worktree_path);
-    configure_directive_files(&mut cmd, &cd_path, &exec_path);
+    configure_directive_file(&mut cmd, &cd_path);
     let output = cmd.output().unwrap();
 
     // Command should have failed (hook failure)
@@ -2745,9 +2744,11 @@ fn test_pre_remove_hook_branch_expansion_detached_head(mut repo: TestRepo) {
     let branch_file = repo.root_path().join("branch-expansion.txt");
     let branch_path = branch_file.to_slash_lossy();
 
-    // Create project config with hook that writes {{ branch }} to file
+    // Create project config with a hook that writes {{ branch }} to file,
+    // guarded the way the hook docs prescribe for every optional variable —
+    // a detached worktree is on no branch, so `branch` is unset there.
     repo.write_project_config(&format!(
-        r#"pre-remove = "echo 'branch={{{{ branch }}}}' > {branch_path}""#,
+        r#"pre-remove = "echo 'branch={{% if branch %}}{{{{ branch }}}}{{% endif %}}' > {branch_path}""#,
     ));
     repo.commit("Add config");
 
@@ -2755,7 +2756,7 @@ fn test_pre_remove_hook_branch_expansion_detached_head(mut repo: TestRepo) {
     repo.write_test_config(r#"worktree-path = "../{{ repo }}.{{ branch }}""#);
     repo.write_test_approvals(&format!(
         r#"[projects."../origin"]
-approved-commands = ["echo 'branch={{{{ branch }}}}' > {branch_path}"]
+approved-commands = ["echo 'branch={{% if branch %}}{{{{ branch }}}}{{% endif %}}' > {branch_path}"]
 "#,
     ));
 
@@ -2778,13 +2779,15 @@ approved-commands = ["echo 'branch={{{{ branch }}}}' > {branch_path}"]
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Verify {{ branch }} expanded to "HEAD" (fallback for detached HEAD state)
+    // Verify {{ branch }} is unset — not the literal "HEAD", which git would
+    // resolve as a ref and which every guard written around `branch` passed
+    // (issue #4009).
     let content =
         std::fs::read_to_string(&branch_file).expect("Hook should have created the branch file");
     assert_eq!(
         content.trim(),
-        "branch=HEAD",
-        "{{ branch }} should expand to 'HEAD' for detached HEAD worktrees"
+        "branch=",
+        "{{ branch }} should be unset for detached HEAD worktrees"
     );
 }
 
@@ -4012,7 +4015,7 @@ fn restore_dir_permissions(dir: &std::path::Path) {
 // convention — `<!-- wt remove (docs-example) -->` in `src/cli/mod.rs`.
 // ============================================================================
 
-/// `wt remove` example for `docs/content/remove.md` — pre-remove hook running
+/// `wt remove` example for `docs/src/content/docs/remove.md` — pre-remove hook running
 /// `flyctl scale count 0`, background cleanup.
 #[rstest]
 fn test_docs_remove_pre_remove_hook(mut repo: TestRepo) {

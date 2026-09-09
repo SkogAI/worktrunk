@@ -125,7 +125,7 @@ Creates [2m~/.config/worktrunk/config.toml[0m with the following content:
 [107m [0m [2m#[0m
 [107m [0m [2m# worktree-path = "~/development/{{ owner }}/{{ repo }}/{{ branch }}"[0m
 [107m [0m [2m#[0m
-[107m [0m [2m# Bare repository (`~/code/myproject/feature-auth`):[0m
+[107m [0m [2m# Bare repository cloned to `~/code/myproject/.git` (`~/code/myproject/feature-auth`):[0m
 [107m [0m [2m#[0m
 [107m [0m [2m# worktree-path = "{{ repo_path }}/../{{ branch | sanitize }}"[0m
 [107m [0m [2m#[0m
@@ -175,7 +175,7 @@ Creates [2m~/.config/worktrunk/config.toml[0m with the following content:
 [107m [0m [2m# branches = false   # Include branches without worktrees (--branches)[0m
 [107m [0m [2m# remotes = false    # Include remote-only branches (--remotes)[0m
 [107m [0m [2m#[0m
-[107m [0m [2m# json-schema = 1    # JSON output schema: 1 (current, bare array) or 2 (envelope); unset emits 1 with a warning[0m
+[107m [0m [2m# json-schema = 2    # JSON output schema: 2 (envelope, default) or 1 (bare array)[0m
 [107m [0m [2m#[0m
 [107m [0m [2m# columns = ["branch", "status", "ci", "path"]   # Columns to show, in order — built-ins or custom headers (omit for the default set)[0m
 [107m [0m [2m#[0m
@@ -193,7 +193,7 @@ Creates [2m~/.config/worktrunk/config.toml[0m with the following content:
 [107m [0m [2m#[0m
 [107m [0m [2m# - `branch` — The branch name[0m
 [107m [0m [2m# - `status` — Git status symbols, plus any user-defined status[0m
-[107m [0m [2m# - `working-diff` — Uncommitted line changes against `HEAD` (header `HEAD±`)[0m
+[107m [0m [2m# - `working-diff` — Uncommitted line changes against `HEAD`, including untracked files (header `HEAD±`)[0m
 [107m [0m [2m# - `ahead-behind` — Commits ahead of and behind the default branch (header `main↕`)[0m
 [107m [0m [2m# - `branch-diff` — Line changes against the default branch (header `main…±`)[0m
 [107m [0m [2m# - `summary` — An LLM-generated summary of the branch[0m
@@ -243,7 +243,8 @@ Creates [2m~/.config/worktrunk/config.toml[0m with the following content:
 [107m [0m [2m# All standard filters work (`sanitize`, `hash_port`, `codename`, …). A row[0m
 [107m [0m [2m# where the template renders empty (e.g. a branch without the key) shows an[0m
 [107m [0m [2m# empty cell; a column that is empty for every row is dropped from the table.[0m
-[107m [0m [2m# `wt list --format json` includes the rendered values under `columns`.[0m
+[107m [0m [2m# `wt list --format json` includes the rendered values under[0m
+[107m [0m [2m# `items[].display.columns` in schema 2, or under `columns` in schema 1.[0m
 [107m [0m [2m#[0m
 [107m [0m [2m# A `Jira` column reading a key kept in git config, and a `Summary` column[0m
 [107m [0m [2m# showing just the first line of the git-native branch description:[0m
@@ -475,7 +476,7 @@ Creates [2m~/.config/worktrunk/config.toml[0m with the following content:
 [107m [0m [2m# """[0m
 [107m [0m [2m# <!-- DEFAULT_SQUASH_TEMPLATE_END -->[0m
 [107m [0m [2m#[0m
-[107m [0m [2m# #### Appending to the prompt [experimental][0m
+[107m [0m [2m# #### Appending to the prompt[0m
 [107m [0m [2m#[0m
 [107m [0m [2m# `template-append` adds to the prompt instead of replacing it. The value is rendered as its own minijinja template (same variables) and injected into the default templates' `{{ user_guidance }}` slot — a `<user-guidance>` block right after `<style>`. It applies to both commit and squash. Use it for personal preferences without restating the whole template:[0m
 [107m [0m [2m#[0m
@@ -525,7 +526,7 @@ With [2m--project[0m, creates [2m.config/wt.toml[0m in the current repositor
 [107m [0m [2m#[0m
 [107m [0m [2m# When many repositories share one self-hosted host, name it once in user config with a pattern-keyed `[projects]` entry (https://worktrunk.dev/config/#user-project-specific-settings) instead of repeating this block in each repo. A repository's own `[forge]` still wins, field by field.[0m
 [107m [0m [2m#[0m
-[107m [0m [2m# ## Commit-message append [experimental][0m
+[107m [0m [2m# ## Commit-message append[0m
 [107m [0m [2m#[0m
 [107m [0m [2m# Project-wide commit-message conventions appended to the LLM commit and squash prompts inside a `<project-guidance>` block, after the main template's `<style>` section (and after any user `<user-guidance>`). Rendered as a minijinja (https://docs.rs/minijinja/) template with the same variables as the main commit template (`{{ branch }}`, `{{ git_diff }}`, etc.), so it can reference them directly. The first time the fragment changes, `wt` prompts the user to approve it — the same one-shot gate
 [107m [0m as project-defined hooks.[0m

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Args, Subcommand};
 
 use super::SwitchFormat;
@@ -204,28 +206,66 @@ $ wt config plugins opencode uninstall
 
 // Ordering: action + inverse adjacent (install, uninstall).
 #[derive(Subcommand)]
-pub enum ConfigPluginsCodexCommand {
-    /// Configure the Worktrunk marketplace in Codex
+pub enum ConfigPluginsPiCommand {
+    /// Install the activity tracking hook
     #[command(
-        after_long_help = r#"Configures the Worktrunk plugin marketplace in Codex. Equivalent to:
+        after_long_help = r#"Writes the Worktrunk hook to Pi's profile-aware user hook directory.
+
+## Examples
 
 ```console
-$ codex plugin marketplace add max-sixty/worktrunk
+$ wt config plugins pi install
+$ wt config plugins pi install --yes
 ```
 
-This does not install the plugin by itself. Afterward, open `/plugins` in Codex and install Worktrunk from the marketplace."#
+## Plugin location
+
+The default location is `~/.omp/agent/hooks/pre/worktrunk.ts`. The installer
+honors `$PI_CONFIG_DIR` and active `$OMP_PROFILE` / `$PI_PROFILE` profiles.
+`$PI_CODING_AGENT_DIR` overrides the agent directory for the default profile
+only — named profiles ignore it, matching Pi's own resolution."#
     )]
     Install,
 
-    /// Remove the Worktrunk marketplace from Codex
+    /// Remove the activity tracking hook
     #[command(
-        after_long_help = r#"Removes the Worktrunk plugin marketplace from Codex. Equivalent to:
+        after_long_help = r#"Removes the Worktrunk hook from Pi's active user hook directory.
+
+## Examples
 
 ```console
+$ wt config plugins pi uninstall
+```"#
+    )]
+    Uninstall,
+}
+
+// Ordering: action + inverse adjacent (install, uninstall).
+#[derive(Subcommand)]
+pub enum ConfigPluginsCodexCommand {
+    /// Install the Worktrunk plugin
+    #[command(
+        after_long_help = r#"Adds the Worktrunk plugin from the marketplace and installs it. Equivalent to:
+
+```console
+$ codex plugin marketplace add max-sixty/worktrunk
+$ codex plugin add worktrunk@worktrunk
+```
+
+Requires `codex` CLI."#
+    )]
+    Install,
+
+    /// Remove the Worktrunk plugin
+    #[command(
+        after_long_help = r#"Uninstalls the Worktrunk plugin from Codex and removes its marketplace. Equivalent to:
+
+```console
+$ codex plugin remove worktrunk@worktrunk
 $ codex plugin marketplace remove worktrunk
 ```
 
-This leaves any already-installed Worktrunk plugin unchanged."#
+Requires `codex` CLI."#
     )]
     Uninstall,
 }
@@ -237,7 +277,7 @@ pub enum ApprovalsCommand {
     #[command(
         after_long_help = r#"Shows every command the project config declares — hooks, aliases, and commit-message guidance — grouped into APPROVED and UNAPPROVED sections. Approvals recorded for commands no longer in the project config (edited or removed since approval) are listed separately.
 
-Reading is all it does: no prompt, no write. `--format=json` emits the same four distinctions as a structured payload — see [Reading approval state](@/config.md#reading-approval-state).
+Reading is all it does: no prompt, no write. `--format=json` emits the same four distinctions as a structured payload — see [Reading approval state](/config/#reading-approval-state).
 
 ## Examples
 
@@ -263,7 +303,7 @@ $ wt config approvals list --format=json | jq -r .state
 By default, shows only unapproved commands. Use `--all` to review all commands
 including previously approved ones.
 
-`--yes` writes the approvals without prompting, which is how a container or CI job pre-approves a project it has just cloned. It trusts every command the project config declares, including one whose template changed since an earlier approval. A caller that wants to look before granting them can list those first — see [Reading approval state](@/config.md#reading-approval-state).
+`--yes` writes the approvals without prompting, which is how a container or CI job pre-approves a project it has just cloned. It trusts every command the project config declares, including one whose template changed since an earlier approval. A caller that wants to look before granting them can list those first — see [Reading approval state](/config/#reading-approval-state).
 
 ## Examples
 
@@ -361,6 +401,26 @@ config precedence: `$OPENCODE_CONFIG_DIR` > `$XDG_CONFIG_HOME/opencode` >
         #[command(subcommand)]
         action: ConfigPluginsOpencodeCommand,
     },
+
+    /// Pi / oh-my-pi activity hook
+    #[command(
+        after_long_help = r#"Activity tracking hook — shows status markers in `wt list`:
+- 🤖 — agent is working
+- 💬 — agent is waiting for input
+
+Pi's `session_shutdown` event clears the marker when the session exits.
+
+## Examples
+
+```console
+$ wt config plugins pi install
+$ wt config plugins pi uninstall
+```"#
+    )]
+    Pi {
+        #[command(subcommand)]
+        action: ConfigPluginsPiCommand,
+    },
 }
 
 // Ordering: action + inverse adjacent (install, uninstall), then related
@@ -382,11 +442,14 @@ Requires `claude` CLI. Skips gracefully if already installed."#
 
     /// Remove the Worktrunk plugin
     #[command(
-        after_long_help = r#"Uninstalls the Worktrunk plugin from Claude Code. Equivalent to:
+        after_long_help = r#"Uninstalls the Worktrunk plugin from Claude Code and removes its marketplace. Equivalent to:
 
 ```console
 $ claude plugin uninstall worktrunk@worktrunk
-```"#
+$ claude plugin marketplace remove worktrunk
+```
+
+Requires `claude` CLI. Both removals run every time, tolerating only the "already gone" error Claude Code itself reports. Running it again is safe, and finishes an uninstall that removed the plugin and then failed on the marketplace."#
     )]
     Uninstall,
 
@@ -501,10 +564,9 @@ pub enum ConfigCommand {
 
     /// Show configuration files & locations
     #[command(
-        after_long_help = r#"Shows location and contents of user config (`~/.config/worktrunk/config.toml`)
-and project config (`.config/wt.toml`). Also shows system config if present.
-
-If a config file doesn't exist, shows defaults that would be used.
+        after_long_help = r#"Shows config sources and checks for invalid TOML or list columns, misplaced or
+deprecated keys, and commands awaiting approval. It renders every section
+before failing; warnings exit zero.
 
 ## Full diagnostics
 
@@ -532,12 +594,17 @@ This tests:
     /// Update deprecated config settings
     #[command(
         after_long_help = r#"Updates deprecated settings in user and project config files
-to their current equivalents, and pins defaults that a future release
-switches — currently `[list] json-schema = 1` — so upgrading doesn't change
-behavior. Shows a diff and asks for confirmation.
+to their current equivalents, removes deprecated keys that have no equivalent,
+and reports each one. Shows a diff and asks for confirmation.
 
 Migrations are computed in memory on demand; nothing is written outside this
-command. Use `--print` to see the migrated TOML without touching any file.
+command. Set `--output <path>` to write a migrated config to that destination
+instead of applying it in place. Use `-` for stdout. When both user and project
+config need migration, stdout emits a labeled inspection artifact and file
+output fails rather than combining the configs.
+
+`--output` omits deprecated `approved-commands` with a stderr warning; only an
+in-place update migrates them to `approvals.toml`.
 
 ## Examples
 
@@ -551,15 +618,20 @@ Apply without confirmation:
 $ wt config update --yes
 ```
 
-Print the migrated config to stdout (no changes written):
+Write the migration artifact to a file:
 ```console
-$ wt config update --print
+$ wt config update --output migrated.toml
+```
+
+Write the migration artifact to stdout:
+```console
+$ wt config update --output=-
 ```"#
     )]
     Update {
-        /// Print the migrated config to stdout instead of writing it
-        #[arg(long)]
-        print: bool,
+        /// Output migrated config (`-` for stdout)
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
     },
 
     /// Manage command approvals
@@ -635,7 +707,7 @@ Approved commands are saved to `~/.config/worktrunk/approvals.toml`. Re-approval
 
     /// Inspect and preview aliases
     #[command(
-        after_long_help = r#"Aliases are command templates configured in user (`~/.config/worktrunk/config.toml`) or project (`.config/wt.toml`) config and run as `wt <name>`. See the [Extending Worktrunk guide](@/extending.md#aliases) for the configuration format.
+        after_long_help = r#"Aliases are command templates configured in user (`~/.config/worktrunk/config.toml`) or project (`.config/wt.toml`) config and run as `wt <name>`. See the [Extending Worktrunk guide](/extending/#aliases) for the configuration format.
 
 ## Examples
 
@@ -669,6 +741,7 @@ $ wt config alias dry-run deploy -- --env=staging
 - **claude** — Claude Code plugin (activity tracking + statusline)
 - **codex** — Codex plugin (Worktrunk configuration skill)
 - **opencode** — OpenCode plugin (activity tracking)
+- **pi** — Pi / oh-my-pi plugin (activity tracking)
 
 ## Examples
 
@@ -676,6 +749,7 @@ $ wt config alias dry-run deploy -- --env=staging
 $ wt config plugins claude install
 $ wt config plugins codex install
 $ wt config plugins opencode install
+$ wt config plugins pi install
 ```"#
     )]
     Plugins {
@@ -689,11 +763,11 @@ $ wt config plugins opencode install
 
 ## Keys
 
-- **cache**: [Regenerable caches — CI status, summaries, git commands, hints, and the `wt switch -` target](@/config.md#wt-config-state-cache)
-- **default-branch**: [The repository's default branch (`main`, `master`, etc.)](@/config.md#wt-config-state-default-branch)
-- **marker**: [Custom status marker for a branch (shown in `wt list`)](@/config.md#wt-config-state-marker)
-- **vars**: [experimental] [Custom variables per branch](@/config.md#wt-config-state-vars)
-- **logs**: [Operation and debug logs](@/config.md#wt-config-state-logs)
+- **cache**: [Regenerable caches — CI status, summaries, git commands, hints, and the `wt switch -` target](/config/#wt-config-state-cache)
+- **default-branch**: [The repository's default branch (`main`, `master`, etc.)](/config/#wt-config-state-default-branch)
+- **marker**: [Custom status marker for a branch (shown in `wt list`)](/config/#wt-config-state-marker)
+- **vars**: [Custom variables per branch](/config/#wt-config-state-vars)
+- **logs**: [Operation and debug logs](/config/#wt-config-state-logs)
 
 ## Examples
 
@@ -764,7 +838,7 @@ pub enum StateCommand {
 - **Vars**: Custom variables per branch
 - **CI status**: Cached GitHub/GitLab CI status per branch (30-60s TTL), plus the largest PR/MR number seen (sizes the `wt list` CI column)
 - **Summaries**: Cached LLM-generated branch summaries (shown in `wt list --full` and `wt switch` preview)
-- **Git commands cache**: SHA-keyed disk caches — merge-tree, ancestry, diff-stats, and `wt switch` preview renders
+- **Git commands cache**: Cached merge-tree, ancestry, diff-stat, and `wt switch` preview results
 - **Hints**: One-time hints that have been shown
 - **Log files**: Operation and debug logs
 - **Trash**: Staged worktree directories awaiting background deletion
@@ -805,9 +879,9 @@ untouched."#)]
 
 ## What's cached
 
-- **CI status** — GitHub/GitLab CI per branch (30–60s TTL), shown in [`wt list`](@/list.md#ci-status), plus the largest PR/MR number seen (sizes the CI column)
+- **CI status** — GitHub/GitLab CI per branch (30–60s TTL), shown in [`wt list`](/list/#ci-status), plus the largest PR/MR number seen (sizes the CI column)
 - **Summaries** — LLM-generated branch summaries (`wt list --full`, `wt switch` preview)
-- **Git commands** — SHA-keyed disk caches: merge-tree, ancestry, diff-stats, and `wt switch` preview renders
+- **Git commands** — cached merge-tree, ancestry, diff-stat, and `wt switch` preview results
 - **Hints** — one-time hints already shown in this repo
 - **Previous branch** — the `wt switch -` target, re-recorded on the next switch
 
@@ -844,9 +918,9 @@ $ wt config state cache clear
 $ git rebase $(wt config state default-branch)
 ```
 
-In a hook or alias template, prefer the `{{ default_branch }}` [template variable](@/hook.md#template-variables); `$(wt config state default-branch)` is for plain shell scripts.
+In a hook or alias template, prefer the `{{ default_branch }}` [template variable](/hook/#template-variables); `$(wt config state default-branch)` is for plain shell scripts.
 
-Without a subcommand, runs `get`. Use `set` to override, or `clear` then `get` to re-detect.
+Without a subcommand, runs `get`. `set` stores the override in the repository's local git config. The override adds no project file and applies to every linked worktree in the clone. `clear` then `get` re-detects. The branch must exist locally for `wt list` comparisons.
 
 `default-branch get` resolves the value and caches it on a miss; the aggregate `wt config state get` only reports the cache (read-only), so it can show `(none)` until something populates it.
 
@@ -859,7 +933,7 @@ Worktrunk detects the default branch automatically:
 3. **Remote query** — If not cached, queries `git ls-remote` — typically 100ms–2s, abandoned after 10s
 4. **Local inference** — If no remote, or the query was abandoned, infers from local branches
 
-Once detected, the result is cached in `worktrunk.default-branch` for fast access.
+Once detected, the result is cached in `worktrunk.default-branch` for fast access. The cache isn't re-validated on every command, so a later change to `origin/HEAD` — a renamed default branch followed by `git remote set-head origin -a` — isn't picked up automatically. `wt config state` flags the drift when the cached value differs from the remote's local HEAD — expected for a deliberate override; `set` adopts the new branch and `clear` re-detects.
 
 An abandoned remote query is the one case that isn't cached: the branch it inferred locally answers that command, but a value guessed while the remote was unreachable would otherwise become permanent, so the next command queries again.
 
@@ -880,7 +954,7 @@ If none of these match, detection fails; set it explicitly with `wt config state
     #[command(
         name = "previous-branch",
         hide = true,
-        after_long_help = r#"**Deprecated** — the previous branch is now part of [`wt config state cache`](@/config.md#wt-config-state-cache). This subcommand still works but prints a deprecation notice.
+        after_long_help = r#"**Deprecated** — the previous branch is now part of [`wt config state cache`](/config/#wt-config-state-cache). This subcommand still works but prints a deprecation notice.
 
 Enables `wt switch -` to return to the previous worktree, similar to `cd -` or `git checkout -`.
 
@@ -986,7 +1060,7 @@ $ wt config state logs clear
     /// One-time hints shown in this repo
     #[command(
         hide = true,
-        after_long_help = r#"**Deprecated** — hints are now part of [`wt config state cache`](@/config.md#wt-config-state-cache). This subcommand still works but prints a deprecation notice.
+        after_long_help = r#"**Deprecated** — hints are now part of [`wt config state cache`](/config/#wt-config-state-cache). This subcommand still works but prints a deprecation notice.
 
 Some hints show once per repo on first use, then are recorded in git config
 as `worktrunk.hints.<name>`, a count of times the hint has been shown.
@@ -1018,28 +1092,9 @@ $ wt config state hints clear NAME   # re-show specific hint
     #[command(
         name = "ci-status",
         hide = true,
-        after_long_help = r#"**Deprecated** — the CI status cache is now part of [`wt config state cache`](@/config.md#wt-config-state-cache). This subcommand still works but prints a deprecation notice.
+        after_long_help = r#"**Deprecated** — the CI status cache is now part of [`wt config state cache`](/config/#wt-config-state-cache). This subcommand still works but prints a deprecation notice.
 
-Caches GitHub/GitLab CI status for display in [`wt list`](@/list.md#ci-status).
-
-Requires `gh` (GitHub) or `glab` (GitLab) CLI, authenticated. Platform auto-detects from the remote URL; set `forge.platform = "github"` (or `"gitlab"`) in `.config/wt.toml` for SSH host aliases or self-hosted instances. For GitHub Enterprise or self-hosted GitLab, also set `forge.hostname`.
-
-Checks open PRs/MRs first, then branch pipelines for branches with upstream. Local-only branches (no remote tracking) show blank.
-
-Results cache for 30-60 seconds. Indicators dim when local changes haven't been pushed.
-
-## Status values
-
-| Status | Meaning |
-|--------|---------|
-| `passed` | All checks passed |
-| `running` | Checks in progress |
-| `failed` | Checks failed |
-| `conflicts` | PR has merge conflicts |
-| `no-ci` | No checks configured |
-| `error` | Fetch error (rate limit, network, auth) |
-
-See [`wt list` CI status](@/list.md#ci-status) for display symbols and colors.
+Status values, display symbols, and fetch behavior: [`wt list` CI status](/list/#ci-status).
 
 Without a subcommand, runs `get` for the current branch. Use `clear` to reset cache for a branch or `clear --all` to reset all."#
     )]
@@ -1067,7 +1122,7 @@ wt list
 ## Use cases
 
 - **Work status** — `🚧` WIP, `✅` ready for review, `🔥` urgent
-- **Agent tracking** — The [Claude Code](@/claude-code.md) plugin sets markers automatically
+- **Agent tracking** — The [Claude Code](/claude-code/) plugin sets markers automatically
 - **Notes** — Any short text: `"blocked"`, `"needs tests"`
 
 ## Storage
@@ -1088,7 +1143,7 @@ Without a subcommand, runs `get` for the current branch. For `--branch`, use `ge
         format: GlobalFormatFlag,
     },
 
-    /// \[experimental\] Custom variables per branch
+    /// Custom variables per branch
     #[command(
         name = "vars",
         after_long_help = r#"Store custom variables per branch. Values are stored as-is — plain strings or JSON.
@@ -1118,7 +1173,7 @@ $ wt config state vars set env=production --branch=main
 
 ## Template access
 
-Variables are available in [hook templates](@/hook.md#template-variables) as `{{ vars.<key> }}`. Use the `default` filter for keys that may not be set:
+Variables are available in [hook templates](/hook/#template-variables) as `{{ vars.<key> }}`. Use the `default` filter for keys that may not be set:
 
 ```toml
 [post-start]

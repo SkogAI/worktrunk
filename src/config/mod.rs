@@ -114,16 +114,32 @@ pub(crate) fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 /// `#[serde(rename = ...)]`; adding the aliases here keeps the unknown-key
 /// round-trip from flagging an accepted name as unknown.
 pub(crate) fn schema_top_level_keys<T: schemars::JsonSchema>() -> Vec<String> {
-    let schema = schemars::SchemaGenerator::default().into_root_schema_for::<T>();
-    let mut keys: Vec<String> = schema
+    let mut keys = schema_property_names::<T>();
+    keys.push("pre-create".to_string());
+    keys.push("post-create".to_string());
+    keys
+}
+
+/// The field names `T`'s schema declares, with `#[serde(rename = "…")]`
+/// applied.
+///
+/// `#[serde(alias = "…")]` is invisible here — schemars only sees canonical
+/// names — so a caller that needs every key serde *accepts* must add the
+/// aliases itself, as [`schema_top_level_keys`] does for
+/// `pre-create`/`post-create`.
+///
+/// [`schema_top_level_keys`] builds on this for whole-config types; the
+/// deprecation layer uses it for *section* types, to tell which keys a
+/// deprecated section can carry into its replacement (see
+/// `drop_unsupported_keys` in `deprecation.rs`).
+pub(crate) fn schema_property_names<T: schemars::JsonSchema>() -> Vec<String> {
+    schemars::SchemaGenerator::default()
+        .into_root_schema_for::<T>()
         .as_object()
         .and_then(|obj| obj.get("properties"))
         .and_then(|p| p.as_object())
         .map(|props| props.keys().cloned().collect())
-        .unwrap_or_default();
-    keys.push("pre-create".to_string());
-    keys.push("post-create".to_string());
-    keys
+        .unwrap_or_default()
 }
 
 /// Whether `key` is a top-level field of a `[projects."<id>"]` table (the
@@ -148,7 +164,6 @@ pub use deprecation::DeprecationInfo;
 pub use deprecation::check_and_migrate;
 pub use deprecation::compute_migrated_content;
 pub use deprecation::copy_approved_commands_to_approvals_file;
-pub use deprecation::detect_deprecations;
 pub use deprecation::format_deprecation_details;
 pub use deprecation::format_deprecation_warnings;
 pub use deprecation::format_migration_diff;
@@ -179,7 +194,7 @@ pub use project::{
 pub use unknown_tree::{
     UnknownAnalysis, UnknownTree, UnknownWarning, collect_unknown_warnings, compute_unknown_tree,
 };
-pub(crate) use user::LoadError;
+pub use user::LoadError;
 pub(crate) use user::project_match::matching_keys as matching_project_keys;
 pub use user::{
     CommitConfig, CommitGenerationConfig, CopyIgnoredConfig, ListColumnConfig, ListConfig,
@@ -577,9 +592,7 @@ task2 = "echo 'Task 2 running' > task2.txt"
         let config = CommitGenerationConfig {
             command: Some("llm -m model".to_string()),
             template: Some("template content".to_string()),
-            template_file: None,
             squash_template: None,
-            squash_template_file: None,
             template_append: None,
         };
 

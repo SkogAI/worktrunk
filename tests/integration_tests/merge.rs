@@ -1201,7 +1201,7 @@ command = "{llm_path_str}"
 // appears on public pages.
 // ============================================================================
 
-/// `wt merge` example for `docs/content/merge.md` — pre-merge hook running
+/// `wt merge` example for `docs/src/content/docs/merge.md` — pre-merge hook running
 /// `cargo nextest run`, one-commit fast-forward merge, background cleanup.
 #[rstest]
 fn test_docs_merge_pre_merge_hook(mut repo: TestRepo) {
@@ -1293,7 +1293,7 @@ impl Registry {
     );
 }
 
-/// `wt merge` example for `docs/content/llm-commits.md` — three commits
+/// `wt merge` example for `docs/src/content/docs/llm-commits.md` — three commits
 /// squashed with an LLM-generated message, then merged to default branch.
 #[rstest]
 fn test_docs_merge_squash_llm(mut repo: TestRepo) {
@@ -1363,7 +1363,7 @@ logic, and authentication tests.";
     );
 }
 
-/// `wt step squash` example for `docs/content/llm-commits.md` — three commits
+/// `wt step squash` example for `docs/src/content/docs/llm-commits.md` — three commits
 /// squashed with an LLM-generated message.
 #[rstest]
 fn test_docs_step_squash_llm(mut repo: TestRepo) {
@@ -1421,7 +1421,7 @@ logic, and authentication tests.";
     });
 }
 
-/// `wt step commit` example for `docs/content/step.md` and `docs/content/llm-commits.md`.
+/// `wt step commit` example for `docs/src/content/docs/step.md` and `docs/src/content/docs/llm-commits.md`.
 /// Feature worktree with two staged files + LLM-generated commit message.
 #[rstest]
 fn test_docs_step_commit_llm(mut repo: TestRepo) {
@@ -2865,6 +2865,9 @@ command = "cat >/dev/null && echo 'feat: add untracked'"
     fs::write(repo.test_config_path(), worktrunk_config).unwrap();
 
     let output = make_snapshot_cmd(&repo, "step", &["commit", "--dry-run"], None)
+        // The worktree-root case exercises the empty relative path in the
+        // temporary-index exclusion.
+        .env("TMPDIR", repo.root_path())
         .output()
         .expect("wt step commit --dry-run failed");
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -2872,6 +2875,10 @@ command = "cat >/dev/null && echo 'feat: add untracked'"
         stdout.contains("untracked.txt"),
         "--dry-run with default --stage=all should include untracked files in the prompt; \
          got stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("worktrunk-temp-index-"),
+        "--dry-run must exclude its temporary index artifacts; got stdout:\n{stdout}"
     );
 
     // The user's real index must not have absorbed the untracked file.
@@ -3026,7 +3033,7 @@ command = "cat >/dev/null && echo 'feat: combined feature work'"
 /// `GIT_INDEX_FILE` pointed at the copy. If that `git add` exits non-zero, the
 /// error must propagate (not silently feed an empty diff to the LLM). We
 /// reproduce a non-zero exit by replacing `.git/index` with garbage — the temp
-/// copy succeeds, but `git add -A` rejects the corrupt index.
+/// copy succeeds, but the all-files `git add` rejects the corrupt index.
 #[rstest]
 fn test_step_commit_dry_run_propagates_git_add_failure(repo: TestRepo) {
     fs::write(repo.root_path().join("new.txt"), "x").expect("Failed to write file");
@@ -3045,8 +3052,8 @@ fn test_step_commit_dry_run_propagates_git_add_failure(repo: TestRepo) {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("git add -A failed"),
-        "expected bail! to surface 'git add -A failed'; got stderr:\n{stderr}"
+        stderr.contains("git add -A -- . failed"),
+        "expected the failing git add command; got stderr:\n{stderr}"
     );
 }
 
@@ -3144,6 +3151,92 @@ command = "cat >/dev/null; echo 'simulated LLM failure' >&2 && exit 1"
         "expected non-zero exit when LLM command fails; stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+// =============================================================================
+// --branch (commit another worktree) tests
+// =============================================================================
+
+/// `wt step commit --branch <b>` commits `<b>`'s worktree, so every prompt
+/// input must come from there. Reading the diff from the invoking worktree —
+/// clean, since the changes are in `<b>` — sent the generator an empty
+/// `<diff>`, and the model's "I don't see any staged changes" reply became the
+/// commit message over a full set of files.
+#[rstest]
+fn test_step_commit_branch_prompt_reads_target_worktree(mut repo: TestRepo) {
+    let feature_wt = repo.add_worktree("feature");
+
+    // The work is in the feature worktree only; the invoking worktree stays clean.
+    fs::write(feature_wt.join("feature_only.txt"), "line one\nline two\n").unwrap();
+
+    // The mock generator saves its prompt outside both worktrees, so `--stage=all`
+    // can't sweep the capture into the commit under test.
+    let captured = repo.home_path().join("captured-prompt.txt");
+    repo.write_test_config(&format!(
+        r#"
+[commit.generation]
+command = "cat > {} && echo 'feat: mock message'"
+"#,
+        captured.to_slash_lossy()
+    ));
+
+    let output = repo
+        .wt_command()
+        .args(["step", "commit", "--branch", "feature", "--no-hooks"])
+        .output()
+        .expect("wt step commit --branch failed to spawn");
+    assert!(
+        output.status.success(),
+        "commit failed; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let prompt = fs::read_to_string(&captured).expect("generator received no prompt");
+    assert!(
+        prompt.contains("feature_only.txt") && prompt.contains("+line one"),
+        "the prompt must carry the target worktree's staged diff; got:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("Branch: feature"),
+        "the prompt must name the committed branch; got:\n{prompt}"
+    );
+
+    // The generated message landed on the commit the prompt described.
+    let message = repo
+        .git_command()
+        .args(["log", "-1", "--format=%s"])
+        .current_dir(&feature_wt)
+        .run()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&message.stdout).trim(),
+        "feat: mock message"
+    );
+}
+
+/// `--show-prompt` previews what a real run would send, so `--branch` selects
+/// the previewed worktree exactly as it selects the committed one.
+#[rstest]
+fn test_step_commit_show_prompt_branch_previews_target_worktree(mut repo: TestRepo) {
+    let feature_wt = repo.add_worktree("feature");
+
+    // --show-prompt previews the existing index, so stage in the target worktree.
+    fs::write(feature_wt.join("feature_only.txt"), "line one\n").unwrap();
+    repo.run_git_in(&feature_wt, &["add", "feature_only.txt"]);
+
+    let output = make_snapshot_cmd(
+        &repo,
+        "step",
+        &["commit", "--show-prompt", "--branch", "feature"],
+        None,
+    )
+    .output()
+    .expect("wt step commit --show-prompt --branch failed to spawn");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("feature_only.txt") && stdout.contains("Branch: feature"),
+        "the preview must describe the target worktree; got:\n{stdout}"
     );
 }
 

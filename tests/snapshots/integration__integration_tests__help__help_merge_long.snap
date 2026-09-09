@@ -9,6 +9,13 @@ info:
     CLICOLOR_FORCE: "1"
     COLUMNS: "500"
     GIT_ALLOW_PROTOCOL: file
+    GIT_CONFIG_COUNT: "2"
+    GIT_CONFIG_GLOBAL: /nonexistent/wt/gitconfig
+    GIT_CONFIG_KEY_0: user.useConfigOnly
+    GIT_CONFIG_KEY_1: rerere.enabled
+    GIT_CONFIG_SYSTEM: /nonexistent/wt/gitconfig
+    GIT_CONFIG_VALUE_0: "true"
+    GIT_CONFIG_VALUE_1: "false"
     LANG: C
     LC_ALL: C
     LLVM_PROFILE_FILE: "[LLVM_PROFILE_FILE]"
@@ -28,6 +35,7 @@ info:
     WORKTRUNK_TEST_PARENT_SHELL: ""
     WORKTRUNK_TEST_POWERSHELL_ENV: "0"
     WORKTRUNK_TEST_POWERSHELL_INSTALLED: "0"
+    WORKTRUNK_TEST_PROBE_TIMEOUT_MS: "60000"
     WORKTRUNK_TEST_SKIP_URL_HEALTH_CHECK: "1"
     WORKTRUNK_TEST_ZSH_INSTALLED: "0"
 ---
@@ -148,7 +156,7 @@ Preserve the exact clean commit graph and tip:
 
 [2mwt merge[0m runs these steps:
 
-1. [1mCommit[0m — Pre-commit hooks run, then uncommitted changes are committed. Post-commit hooks run in background. Skipped when squashing (the default) — changes are staged during the squash step instead. With [2m--no-squash[0m, this is the only commit step.
+1. [1mCommit[0m — Pre-commit hooks run, then uncommitted changes are committed. Post-commit hooks run in the background; when step 7 removes the worktree they are anchored on, the merge reports them rather than running them. This step is skipped when squashing (the default) — changes are staged during the squash step instead. With [2m--no-squash[0m, this is the only commit step.
 2. [1mSquash[0m — Combines all commits since target into one (like GitHub's "Squash and merge"). Use [2m--stage[0m to control what gets staged: [2mall[0m (default), [2mtracked[0m, or [2mnone[0m. Working-tree changes swept into the squash are backed up first to [2mrefs/wt-backup/<branch>[0m. With [2m--no-squash[0m, individual commits are preserved.
 3. [1mRebase[0m — Rebases onto target, skipping when nothing needs replaying ([2mwt step rebase[0m gives the conditions). A conflict stops the merge with the rebase left open in the worktree, to resolve or abort. With [2m--no-rebase[0m, the graph produced by earlier commit/squash steps is preserved and the target must be able to fast-forward to its tip.
 4. [1mPre-merge hooks[0m — Hooks run after rebase, before merge. Failures abort. See [2mwt hook[0m.

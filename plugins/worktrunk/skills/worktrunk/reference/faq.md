@@ -10,7 +10,7 @@ Branch switching uses one directory: uncommitted changes from one agent get mixe
 
 Git's built-in worktree commands work but require manual lifecycle management:
 
-```bash
+```console
 # Plain git worktree workflow
 $ git worktree add -b feature-branch ../myapp-feature main
 $ cd ../myapp-feature
@@ -23,7 +23,7 @@ $ git branch -d feature-branch
 
 Worktrunk automates the full lifecycle:
 
-```bash
+```console
 $ wt switch --create feature-branch  # Creates worktree, runs setup hooks
 # ...work...
 $ wt merge                            # Merges into default branch, cleans up
@@ -51,6 +51,12 @@ These tools can be used together—run git-machete or git-town inside individual
 
 Git TUIs operate on a single repository. Worktrunk manages multiple worktrees, runs automation hooks, and aggregates status across branches. TUIs work inside each worktree directory.
 
+## How much disk do worktrees use?
+
+Worktrees share one `.git`. Each adds a checkout of the tracked files, plus whatever gitignored build output you copy in.
+
+On APFS, btrfs, and XFS (not ext4 or NTFS), [`wt step copy-ignored`](https://worktrunk.dev/step/#copy-on-write) reflinks that output, so a new worktree shares the primary worktree's disk blocks. A later build rewrites only what changed, and the rest stays shared. On one machine, 56 worktrees of a Rust repository with a 40GB `target/` came to 2.6TB by `du` and 0.7TB on disk.
+
 ## Does Worktrunk support stacked branches?
 
 Not natively — stacked-branch workflows are a large design space, so Worktrunk treats them as an extension rather than a built-in. [`worktrunk-sync`](https://github.com/pablospe/worktrunk-sync) is a community tool that auto-detects the branch dependency tree from git history and rebases each branch onto its parent in topological order. Install with `cargo install worktrunk-sync` and run as `wt sync` (via [custom subcommands](https://worktrunk.dev/extending/#custom-subcommands)).
@@ -59,7 +65,7 @@ Not natively — stacked-branch workflows are a large design space, so Worktrunk
 
 Stash the changes, create the worktree, then pop:
 
-```bash
+```console
 $ git stash push -u           # -u also stashes untracked files
 $ wt switch --create feature  # new branch off the default branch
 $ git stash pop               # changes reappear in the new worktree
@@ -138,7 +144,7 @@ Fish and Nushell wrappers live at a path named after the command, so install wri
 
 ### 4. Metadata in `.git/` (automatic)
 
-Worktrunk stores small amounts of cache and log data in the repository's `.git/` directory:
+Worktrunk stores repository state, caches, and logs under `.git/`:
 
 | Location | Purpose | Created by |
 |----------|---------|------------|
@@ -155,11 +161,31 @@ Worktrunk stores small amounts of cache and log data in the repository's `.git/`
 
 None of this is tracked by git or pushed to remotes.
 
-**To remove:** `wt config state clear` removes all worktrunk data — config keys, caches, markers, hints, variables, logs, and stale trash.
+**To remove:** `wt config state clear` removes all repository data: config keys, caches, markers, hints, variables, logs, and stale trash.
+
+### 5. Agent integrations
+
+Created by the `wt config plugins <agent>` install commands. Each writes outside worktrunk's own config directory, into the agent's:
+
+| File | Created by | Purpose |
+|------|------------|---------|
+| `~/.config/opencode/plugins/worktrunk.ts` | `wt config plugins opencode install` | Activity markers in `wt list` |
+| `~/.omp/agent/hooks/pre/worktrunk.ts` | `wt config plugins pi install` | Activity markers in `wt list` |
+| `~/.claude/settings.json` | `wt config plugins claude install-statusline` | Adds a `statusLine` entry running `wt list statusline --format=claude-code` |
+
+The OpenCode path follows `$OPENCODE_CONFIG_DIR` > `$XDG_CONFIG_HOME/opencode` > `~/.config/opencode`; the Pi path follows `$PI_CONFIG_DIR`, `$OMP_PROFILE`/`$PI_PROFILE`, and `$PI_CODING_AGENT_DIR`; Claude Code's follows `$CLAUDE_CONFIG_DIR`. The two plugin files are worktrunk's own, so install writes them whole. `settings.json` belongs to Claude Code, so install merges the `statusLine` key into it and leaves the rest untouched.
+
+`wt config plugins claude install` and `wt config plugins codex install` write nothing themselves — they run `claude` / `codex` to register the marketplace and install the plugin, and each CLI records that in its own config (`~/.claude/plugins/`, `~/.codex/config.toml`).
+
+**To remove:** `wt config plugins opencode uninstall` and `wt config plugins pi uninstall` delete their plugin file. `wt config plugins claude uninstall` / `codex uninstall` remove the plugin and marketplace through that CLI. The statusline entry is removed by editing `settings.json`.
+
+### 6. Temporary files (automatic)
+
+Worktrunk creates temporary Git index copies named `$TMPDIR/worktrunk-temp-index-*`. `wt list`, `wt list statusline`, `wt step diff`, `wt step commit --dry-run`, and `wt switch` use them to inspect staged or working-tree state without changing the real index. `wt list` also creates a `$TMPDIR/worktrunk-list-objects-*` directory so its merge probes do not add unreachable objects to the repository. When the system temp directory is unavailable, both fall back to Git's metadata: `worktrunk-list-objects-*` under the Git common directory and `worktrunk-temp-index-*` under the worktree's Git directory. A normal exit removes these files and directories; an interrupted process can leave one behind for manual cleanup.
 
 ### What Worktrunk does NOT create
 
-- No files outside `.git/`, config directories, or worktree directories
+- No files outside the six sections above: `.git/`, worktrunk's config directory, worktree directories, the shell startup files and wrapper paths of section 3, the agent config paths of section 5 (only when you run a `wt config plugins` install), and the system temporary directory
 - No global git hooks
 - No modifications to `~/.gitconfig`
 - No long-running background processes or daemons
@@ -199,6 +225,7 @@ A branch checked out in a second worktree is retained regardless, `-D` included.
 - `wt config state clear` — removes all worktrunk data from `.git/` (config keys, caches, markers, hints, variables, logs, stale trash)
 - `wt config shell install` — when migrating an integration to a new location, removes the file left at the old one: fish `conf.d/wt.fish` (now `functions/wt.fish`) and nushell wrappers stranded under `<config-dir>/vendor/autoload` (now `<data-dir>/vendor/autoload`). The old path is where worktrunk's own wrapper lived and is named after the command being installed, so it's taken back whole without reading it — a `conf.d/wt.fish` left in place would be sourced at startup and shadow the new wrapper anyway. Only that exact filename is touched, and each removal is printed
 - `wt config shell uninstall` — removes integration lines from bash/zsh/PowerShell rc files, and deletes worktrunk's wrapper and completion files (fish `functions/`, `conf.d/`, and `completions/`; nushell `vendor/autoload`). Uninstall takes no command name, so it lists those directories and recognizes files by worktrunk's own content markers, whatever binary name they were installed under; files without the markers are left alone. An rc file belongs to the user, so a line qualifies only where it runs the init command: one that merely mentions it, inside a comment, an `echo`, or an alias body, stays. Every line uninstall does take is printed, before removal and again after
+- `wt config plugins opencode uninstall` / `wt config plugins pi uninstall` — deletes that agent's `worktrunk.ts` plugin file. Only worktrunk's own file is touched; the rest of the agent's plugin directory is left alone
 
 See [What files does Worktrunk create?](#what-files-does-worktrunk-create) for details.
 
@@ -215,6 +242,7 @@ User hooks and user aliases don't require approval (you defined them). Commands 
 
 ### Example approval prompt
 
+```console
 ▲ repo needs approval to execute 3 commands:
 
 ○ pre-start install:
@@ -225,6 +253,7 @@ User hooks and user aliases don't require approval (you defined them). Commands 
   echo 'PORT={{ branch | hash_port }}' > .env.local
 
 ❯ Allow and remember? [y/N]
+```
 
 Use `--yes` to bypass prompts (useful for CI/automation).
 
@@ -234,7 +263,7 @@ All hook executions and LLM commands are recorded in `.git/wt/logs/commands.json
 
 View the log with `wt config state logs get`, or query directly:
 
-```bash
+```console
 # Recent commands
 $ tail -5 .git/wt/logs/commands.jsonl | jq .
 
@@ -268,9 +297,11 @@ Confirm it with `wt config alias dry-run <name>`: if the value is already substi
 
 To defer a variable to the nested command, wrap it as `{% raw %}{{ branch }}{% endraw %}`; for `wt step for-each`, also keep it inside a quoted `sh -c '…'` so the alias's shell doesn't word-split it. See [deferring expansion in an alias](https://worktrunk.dev/extending/#deferring-expansion-to-a-nested-wt-command). A repo-level variable like `{{ default_branch }}` is unaffected — it is identical in every worktree.
 
-## Installation fails with C compilation errors
+## What system dependencies are required?
 
-Errors related to tree-sitter or C compilation (C99 mode, `le16toh` undefined) can be avoided by installing without syntax highlighting:
+Worktrunk requires Git 2.43 or newer.
+
+Installing with Cargo and the default features also requires a C99 compiler for bash syntax highlighting. If tree-sitter or C compilation fails (C99 mode, `le16toh` undefined), install without syntax highlighting:
 
 ```bash
 cargo install worktrunk --no-default-features --features cli
